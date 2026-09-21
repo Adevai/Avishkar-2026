@@ -1,0 +1,79 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: avishkar_db
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: ${PGPASSWORD:-spark_dev_password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spark -d avishkar_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not exposed to host by default — backend reaches it over the compose network.
+    # Uncomment for local debugging:
+    # ports:
+    #   - "5432:5432"
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      # ── Database (compose-network service name "db") ──
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: avishkar_db
+      PGUSER: spark
+      PGPASSWORD: ${PGPASSWORD:-spark_dev_password}
+      # ── Auth ──
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env or your shell}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-24h}
+      # ── CORS (browser origin that talks to this API) ──
+      CORS_ORIGIN: ${CORS_ORIGIN:-}
+      # ── AI / mail integrations (all optional) ──
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # ── Live job sources ──
+      ADZUNA_APP_ID: ${ADZUNA_APP_ID:-}
+      ADZUNA_APP_KEY: ${ADZUNA_APP_KEY:-}
+      SERPAPI_KEY: ${SERPAPI_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      # ── Background features ──
+      AUTO_SYNC_CRON: ${AUTO_SYNC_CRON:-false}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-180}
+      SEED_LARGE_DATASET: ${SEED_LARGE_DATASET:-true}
+    ports:
+      - "5000:5000"
+
+  # Auto-HTTPS reverse proxy — set SITE_DOMAIN env (e.g. spark.ac.in) and
+  # ensure DNS points at this host. Caddy obtains/renews certificates itself.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

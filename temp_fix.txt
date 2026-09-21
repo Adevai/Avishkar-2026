@@ -1,0 +1,14 @@
+﻿        </div>
+
+        {/* Printable Passport Body */}
+        <div ref={passportRef} className="p-6 sm:p-8 space-y-6 print:p-0 print:space-y-4">
+          
+          {/* 3D Holographic Passport Card */}
+          <HolographicCard student={student} />
+
+          {/* Student Profile Identity Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 p-5 rounded-2xl bg-slate-50 border border-slate-200/80">
+            <div className="flex items-center gap-3 sm:col-span-2">
+              <img
+                src={student.avatar || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=200"}
+                alt={student.name}

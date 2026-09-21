@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env
+*.log
+*.md
+screenshots
+eng.traineddata
+.freebuff

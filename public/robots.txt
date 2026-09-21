@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /$
+Disallow: /admin
+Disallow: /database
+Disallow: /dashboard
+Disallow: /onboarding
+
+Sitemap: https://spark.ac.in/sitemap.xml

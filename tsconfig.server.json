@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "ignoreDeprecations": "6.0",
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["server/**/*.ts", "src/data/**/*.ts", "src/utils/matchCalculator.ts", "src/types/**/*.ts"],
+  "exclude": ["node_modules", "dist", "server/**/*.test.ts"]
+}

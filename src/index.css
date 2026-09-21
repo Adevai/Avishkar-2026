@@ -1,0 +1,192 @@
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400..700&family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --gold: #C9A24C;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Make focus rings consistent and premium */
+  *:focus-visible {
+    @apply outline-none ring-4 ring-blue-400 ring-offset-2 ring-offset-slate-50;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: 'Instrument Sans', 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-white px-4 py-2 text-sm font-semibold text-black shadow-lg shadow-white/10 transition-all hover:bg-slate-200 active:scale-95;
+  }
+  
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-white/5 border border-white/10 backdrop-blur-md px-4 py-2 text-sm font-medium text-white transition-all hover:bg-white/10 active:scale-95;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  .display-tight {
+    font-family: 'Instrument Sans', sans-serif;
+    letter-spacing: -0.035em;
+  }
+}
+
+/* ── Premium scrollbar ─────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* ── Component classes ─────────────────────────────────────────── */
+
+/* ── Component classes ─────────────────────────────────────────── */
+
+.fintech-card {
+    @apply bg-white rounded-2xl transition-all duration-300 border border-slate-100;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.03);
+  }
+  .fintech-card:hover {
+    box-shadow: 0 12px 30px rgba(0,0,0,0.06);
+    @apply -translate-y-1;
+  }
+
+.fintech-btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-6 py-3 text-sm font-bold text-white transition-all duration-300 hover:-translate-y-0.5 active:translate-y-0 active:scale-[0.98];
+  background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
+  box-shadow: 0 8px 20px -6px rgba(99, 102, 241, 0.5);
+}
+.fintech-btn-primary:hover {
+  box-shadow: 0 12px 28px -6px rgba(99, 102, 241, 0.7);
+}
+
+.fintech-btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-6 py-3 text-sm font-semibold bg-white text-slate-700 shadow-sm ring-1 ring-slate-200 transition-all duration-300 hover:bg-slate-50 hover:shadow-md hover:ring-slate-300 active:scale-[0.98];
+}
+
+.fintech-gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-violet-600;
+}
+
+.premium-shadow {
+  box-shadow: 0 12px 48px -12px rgba(0,0,0,0.1);
+}
+
+.premium-border {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+/* Eyebrow label — small caps kicker above headings */
+.eyebrow {
+  @apply inline-flex items-center gap-2 text-[11px] font-bold uppercase tracking-[0.18em] text-gold-600;
+}
+
+/* Display heading scale */
+.display-1 {
+  @apply font-display text-5xl sm:text-6xl lg:text-7xl font-bold display-tight leading-[1.02];
+}
+.display-2 {
+  @apply font-display text-4xl sm:text-5xl font-bold display-tight leading-[1.05];
+}
+.display-3 {
+  @apply font-display text-2xl sm:text-3xl font-bold display-tight;
+}
+
+/* Card primitives */
+.premium-card {
+  @apply bg-white rounded-2xl shadow-card border border-ink-900/[0.06];
+  transition: box-shadow 0.35s cubic-bezier(0.16,1,0.3,1), transform 0.35s cubic-bezier(0.16,1,0.3,1);
+}
+.premium-card-hover {
+  @apply hover:shadow-card-hover hover:-translate-y-0.5;
+}
+
+/* ── Reveal on scroll ─────────────────────────────────────────── */
+.reveal {
+  opacity: 0;
+  transform: translateY(22px);
+  transition: opacity 0.7s cubic-bezier(0.16,1,0.3,1), transform 0.7s cubic-bezier(0.16,1,0.3,1);
+  will-change: opacity, transform;
+}
+.reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ── Aurora / gradient accents ────────────────────────────────── */
+.aurora {
+  background:
+    radial-gradient(60% 50% at 15% 20%, rgba(56,168,248,0.1) 0%, transparent 60%),
+    radial-gradient(50% 45% at 85% 15%, rgba(14,140,233,0.1) 0%, transparent 55%),
+    radial-gradient(45% 45% at 60% 90%, rgba(56,168,248,0.05) 0%, transparent 60%);
+}
+
+.ink-mesh {
+  background:
+    radial-gradient(80% 120% at 85% 0%, rgba(56,168,248,0.12) 0%, transparent 55%),
+    radial-gradient(70% 100% at 10% 100%, rgba(14,140,233,0.12) 0%, transparent 55%),
+    #0f172a; /* slate-900 */
+}
+
+/* Gold hairline divider */
+.gold-hairline {
+  background: linear-gradient(90deg, transparent, rgba(201,162,76,0.55), transparent);
+  height: 1px;
+}
+
+/* Shine sweep on dark CTAs */
+.btn-gold {
+  @apply inline-flex items-center justify-center gap-2 rounded-full bg-gold-500 px-6 py-3 text-sm font-bold text-ink-950 transition-all duration-300 hover:bg-gold-400 hover:shadow-glow active:scale-[0.98];
+}
+.btn-ink {
+  @apply inline-flex items-center justify-center gap-2 rounded-full bg-ink-900 px-6 py-3 text-sm font-bold text-white transition-all duration-300 hover:bg-ink-800 active:scale-[0.98];
+}
+.btn-ghost {
+  @apply inline-flex items-center justify-center gap-2 rounded-full border border-ink-900/10 bg-white/60 px-6 py-3 text-sm font-bold text-ink-800 backdrop-blur transition-all duration-300 hover:border-gold-500/60 hover:text-ink-950 active:scale-[0.98];
+}
+
+/* Linear-like animations (kept for legacy components) */
+@keyframes slide-up-fade {
+  0% { opacity: 0; transform: translateY(10px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.animate-slide-up-fade {
+  animation: slide-up-fade 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Input styles */
+input[type="text"], input[type="email"], input[type="password"] {
+  @apply transition-shadow duration-200;
+}
+input[type="text"]:focus, input[type="email"]:focus, input[type="password"]:focus {
+  @apply shadow-[0_0_0_3px_rgba(201,162,76,0.18)] border-gold-500;
+}
