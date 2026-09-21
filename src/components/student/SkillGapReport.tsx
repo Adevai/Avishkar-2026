@@ -1,4 +1,4 @@
-import { SkillConstellation } from '../three/SkillConstellation';
+
 import React, { useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import {
