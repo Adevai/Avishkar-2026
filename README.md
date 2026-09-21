@@ -1,32 +1,41 @@
-# React + TypeScript + Vite
+# Avishkar - Next-Gen Student Employability Platform 🚀
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+**Avishkar** is an AI-driven educational portal focused on continuous student upskilling, competency tracking, and academia-industry collaboration. 
 
-Currently, two official plugins are available:
+## 🌟 Key Features
+- **Personalized Learning Roadmaps**: AI-curated milestones targeting specific competency gaps to boost employability.
+- **Dynamic Skill Gap Analysis**: Interactive dashboards mapping a student's acquired skills against industry benchmarks.
+- **AI Copilot**: An integrated AI assistant providing real-time career guidance, resume feedback, and interview preparation.
+- **Placement & Internship Tracking**: Seamlessly connects academic talent with industry pipelines.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 🛠️ Tech Stack
+- **Frontend**: React 19, TypeScript, Tailwind CSS, Vite
+- **Backend**: Node.js, Express
+- **Database**: PostgreSQL
 
-## React Compiler
+## 🚀 Getting Started
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### Prerequisites
+Make sure you have [Node.js](https://nodejs.org/) (v18+) installed on your machine.
 
-## Expanding the Oxlint configuration
+### Installation
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/Adevai/Avishkar-2026.git
+   cd Avishkar
+   ```
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-```
+2. **Install dependencies**
+   *(Note: Use `--legacy-peer-deps` due to React 19 peer-dependency rules in certain packages)*
+   ```bash
+   npm install --legacy-peer-deps
+   ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+3. **Run the development server**
+   ```bash
+   npm run dev
+   ```
+
+4. **Open your browser**
+   Navigate to the local URL provided by Vite (usually `http://localhost:5173` or `http://localhost:5174`) to see the application.
