@@ -13,7 +13,6 @@ import {
   RefreshCw
 } from 'lucide-react';
 
-import { useApp } from '../../context/AppContext';
 import { api } from '../../services/api';
 
 interface DbNotification {
@@ -69,7 +68,6 @@ function timeAgo(dateStr?: string): string {
 }
 
 export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen, onClose }) => {
-  const { student } = useApp();
   const [notifications, setNotifications] = useState<DbNotification[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
@@ -77,15 +75,15 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({ isOpen
     setIsLoading(true);
     try {
       const data = await api.getNotifications();
-      // Prefer notifications targeted at this user; fall back to all (shared feed)
-      const scoped = (data as DbNotification[]).filter(n => !n.user_id || n.user_id === student.id);
-      setNotifications(scoped.length > 0 ? scoped : (data as DbNotification[]).slice(0, 12));
+      // The backend scopes to the authenticated user (user_id/email).
+      // (students.id ≠ users.id, so no client-side re-filtering here.)
+      setNotifications(data as DbNotification[]);
     } catch {
       setNotifications([]);
     } finally {
       setIsLoading(false);
     }
-  }, [student.id]);
+  }, []);
 
   // Load on open, and lightly poll while the drawer is open
   useEffect(() => {

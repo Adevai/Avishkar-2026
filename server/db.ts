@@ -3,16 +3,41 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const config: PoolConfig = {
-  host: process.env.PGHOST || 'localhost',
-  port: parseInt(process.env.PGPORT || '5432', 10),
-  database: process.env.PGDATABASE || 'avishkar_db',
-  user: process.env.PGUSER || 'postgres',
-  password: process.env.PGPASSWORD || 'postgres',
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-};
+// Production platforms (Render, Railway, Supabase, Neon, Heroku…) expose a
+// single DATABASE_URL; local dev keeps the granular PG* variables. Set
+// PGSSL=require for managed Postgres, PGSSL_STRICT=true to enforce CA validation.
+const databaseUrl = process.env.DATABASE_URL?.trim();
+const poolMax = parseInt(process.env.PGPOOL_MAX || '20', 10) || 20;
+
+function resolveSsl(): PoolConfig['ssl'] {
+  if (databaseUrl && /sslmode=(require|verify-ca|verify-full)/.test(databaseUrl)) {
+    return { rejectUnauthorized: process.env.PGSSL_STRICT === 'true' };
+  }
+  if (process.env.PGSSL === 'require') {
+    return { rejectUnauthorized: process.env.PGSSL_STRICT === 'true' };
+  }
+  return undefined;
+}
+
+const config: PoolConfig = databaseUrl
+  ? {
+      connectionString: databaseUrl,
+      max: poolMax,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+      ssl: resolveSsl(),
+    }
+  : {
+      host: process.env.PGHOST || 'localhost',
+      port: parseInt(process.env.PGPORT || '5432', 10),
+      database: process.env.PGDATABASE || 'avishkar_db',
+      user: process.env.PGUSER || 'postgres',
+      password: process.env.PGPASSWORD || 'postgres',
+      max: poolMax,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+      ssl: resolveSsl(),
+    };
 
 export const pool = new Pool(config);
 
@@ -25,9 +50,12 @@ export async function query(text: string, params?: any[]) {
   try {
     const res = await pool.query(text, params);
     const duration = Date.now() - start;
+    if (duration > 1000) {
+      console.warn(`[db] Slow query (${duration}ms): ${text.slice(0, 80).replace(/\s+/g, ' ')}…`);
+    }
     return res;
   } catch (error) {
-    console.error('Database query error:', { text, error });
+    console.error('Database query error:', { text: text.slice(0, 120), error: (error as any)?.message });
     throw error;
   }
 }
@@ -283,6 +311,29 @@ export async function initDatabase() {
     // widen the column so aggregator syncs never fail on type.
     await client.query(`
       ALTER TABLE jobs ALTER COLUMN deadline TYPE TEXT;
+    `);
+
+    // Recruiter ownership + job lifecycle. Aggregated/synced listings stay
+    // unowned (posted_by IS NULL) — only recruiters who posted via the API own rows.
+    await client.query(`
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS posted_by VARCHAR(64);
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS posted_by_name VARCHAR(255);
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'open';
+      ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+      CREATE INDEX IF NOT EXISTS idx_jobs_posted_by ON jobs(posted_by);
+      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+    `);
+
+    // Label unowned jobs with their company so "posted by" never renders blank.
+    // (Never invents ownership — only fills the display name.)
+    await client.query(`
+      UPDATE jobs SET posted_by_name = company
+      WHERE posted_by IS NULL AND (posted_by_name IS NULL OR posted_by_name = '');
+    `);
+
+    // Student job-alert digest opt-out flag
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS job_alerts_enabled BOOLEAN DEFAULT TRUE;
     `);
 
     // Server-side institution verification flag (distinct from client-side id_card_verified)

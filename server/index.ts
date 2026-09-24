@@ -3,11 +3,13 @@ import cors from 'cors';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { router } from './routes';
-import { initDatabase } from './db';
+import { initDatabase, pool } from './db';
 import { seedDatabase } from './seed';
 import { generateLargeSeed } from './seedGenerator';
 import { seedAlumniNetwork } from './alumniSeed';
+import { seedAlumniActivity } from './alumniActivitySeed';
 import { startJobSyncScheduler } from './jobSync';
+import { startJobAlertScheduler } from './jobAlerts';
 import { startHeartbeat, connectedClients } from './events';
 import path from 'path';
 import fs from 'fs';
@@ -15,8 +17,18 @@ import fs from 'fs';
 dotenv.config();
 
 export const app = express();
-const PORT = process.env.PORT || 5000;
+// Guard against PORT=0 in .env (binds to a random ephemeral port — health
+// checks and the Vite proxy both expect a real, fixed port).
+const PORT = (() => {
+  const p = parseInt(process.env.PORT || '5000', 10);
+  return Number.isFinite(p) && p > 0 ? p : 5000;
+})();
 const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// Behind nginx/Render/Heroku etc., trust the first proxy so req.ip reflects
+// the real client — otherwise the in-memory rate limiter buckets everyone
+// under the proxy IP.
+app.set('trust proxy', 1);
 
 // ── CORS: locked down in production via comma-separated allowed origins ──────
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
@@ -157,8 +169,10 @@ function shutdown(signal: string) {
   console.log(`\n${signal} received — shutting down gracefully…`);
   if (server) {
     server.close(() => {
-      console.log('HTTP server closed.');
-      process.exit(0);
+      pool.end().finally(() => {
+        console.log('HTTP server closed. DB pool drained.');
+        process.exit(0);
+      });
     });
     // Force-exit if connections don't drain in 10s
     setTimeout(() => {
@@ -188,6 +202,11 @@ async function startServer() {
       console.warn('⚠️  Alumni seed skipped:', err.message)
     );
 
+    // Demo mentorship room, chat history & fast-track opportunity (idempotent)
+    await seedAlumniActivity().catch(err =>
+      console.warn('⚠️  Alumni activity seed skipped:', err.message)
+    );
+
     server = app.listen(PORT, () => {
       console.log(`⚡ S.P.A.R.K. PostgreSQL Backend running on http://localhost:${PORT} [${NODE_ENV}]`);
       console.log(`🔗 Health Check: http://localhost:${PORT}/api/health`);
@@ -198,6 +217,7 @@ async function startServer() {
 
     // Optional background auto-sync of live job postings (AUTO_SYNC_CRON=true)
     startJobSyncScheduler();
+    startJobAlertScheduler();
 
     // SSE keepalive pings every 30s so proxies keep event streams open
     startHeartbeat();

@@ -6,7 +6,7 @@ import { ASSESSMENT_QUESTIONS, COLLEGE_DEPARTMENT_STATS, GOVT_REGIONAL_STATS, EM
 import { calculateJobMatch } from '../src/utils/matchCalculator';
 import { askCopilot } from '../src/utils/geminiService';
 import { extractSkillsFromText } from './nlpEngine';
-import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail } from './emailService';
+import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail } from './emailService';
 import { hashPassword, comparePassword, signToken, requireAuth } from './auth';
 import { verifyInstitutionServer } from './institutionVerify';
 import { aggregateJobs } from './jobAggregator';
@@ -41,6 +41,45 @@ router.get('/events', (req: Request, res: Response) => {
 // ==========================================
 // 0b. INSTITUTION / COLLEGE VERIFICATION
 // ==========================================
+// Server-side proxy for open institution-registry APIs. The upstreams send no
+// Access-Control-Allow-Origin header, so browser fetches fail CORS — the client
+// now calls this endpoint instead. Failures degrade gracefully (empty results).
+router.get('/institutions/external', async (req: Request, res: Response) => {
+  const source = String(req.query.source || 'hipolabs');
+  const name = String(req.query.name || req.query.q || '').trim();
+  if (name.length < 2) {
+    return res.json({ results: [] });
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3500);
+    let upstream: string;
+    if (source === 'aicte') {
+      upstream = `https://indian-colleges-list.vercel.app/api/institutions/search?state=Maharashtra&q=${encodeURIComponent(name)}`;
+    } else {
+      upstream = `http://universities.hipolabs.com/search?country=India&name=${encodeURIComponent(name)}`;
+    }
+    const upstreamRes = await fetch(upstream, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (!upstreamRes.ok) {
+      return res.json({ results: [] });
+    }
+    const data: any = await upstreamRes.json();
+    // Normalize both upstream shapes to { results: [...] } for the client
+    const results: any[] = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.results)
+        ? data.results
+        : [];
+    return res.json({ results: results.slice(0, 15) });
+  } catch {
+    // Upstream down/timed out — empty result set, the local registry still works
+    return res.json({ results: [] });
+  }
+});
+
 router.post('/verify/institution', async (req: Request, res: Response) => {
   const { name } = req.body || {};
   if (!name || typeof name !== 'string') {
@@ -215,6 +254,48 @@ router.get('/students', async (req: Request, res: Response) => {
       readinessScore: r.readiness_score,
     }));
     res.json(formatted);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// One-page identity bootstrap for the signed-in user (JWT) → student profile.
+// Lets the frontend sync its demo profile with the real account after login.
+// NOTE: must be registered BEFORE '/students/:id' so 'me' isn't eaten as an id.
+router.get('/students/me', requireAuth, async (req: Request, res: Response) => {
+  const user = (req as any).user;
+  try {
+    const r = await query(
+      'SELECT * FROM students WHERE user_id = $1 OR LOWER(email) = $2 ORDER BY (user_id = $1) DESC LIMIT 1',
+      [user.sub, user.email]
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'No student profile linked to this account.' });
+    }
+    const s = r.rows[0];
+    res.json({
+      id: s.id,
+      userId: s.user_id,
+      name: s.name,
+      email: s.email,
+      avatar: s.avatar,
+      college: s.college,
+      degree: s.degree,
+      branch: s.branch,
+      semester: s.semester,
+      cgpa: parseFloat(s.cgpa),
+      graduationYear: s.graduation_year,
+      targetRole: s.target_role,
+      bio: s.bio,
+      resumeUploaded: s.resume_uploaded,
+      resumeName: s.resume_name,
+      githubUrl: s.github_url,
+      linkedinUrl: s.linkedin_url,
+      declaredSkills: s.declared_skills || [],
+      verifiedSkills: s.verified_skills || [],
+      assessmentCompleted: s.assessment_completed,
+      readinessScore: s.readiness_score,
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -553,6 +634,16 @@ router.post('/assessments/submit', async (req: Request, res: Response) => {
       );
     }
 
+    // Guarantee a roadmap exists so the Learning Roadmap tab is never empty.
+    const rmCheck = await query('SELECT id FROM roadmaps WHERE student_id = $1', [studentId]);
+    if (rmCheck.rows.length === 0) {
+      const milestones = await generateDefaultRoadmap(studentId);
+      await query(
+        'INSERT INTO roadmaps (id, student_id, milestones) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+        [`rdm-${studentId}`, studentId, JSON.stringify(milestones)]
+      );
+    }
+
     res.json({
       success: true,
       assessmentId,
@@ -604,15 +695,117 @@ router.get('/assessments/student/:studentId', async (req: Request, res: Response
 // ==========================================
 router.get('/roadmaps/:studentId', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM roadmaps WHERE student_id = $1', [req.params.studentId]);
+    const studentId = String(req.params.studentId);
+    let result = await query('SELECT * FROM roadmaps WHERE student_id = $1', [studentId]);
+    // Auto-generate a baseline roadmap the first time a student opens the tab.
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Roadmap not found' });
+      const milestones = await generateDefaultRoadmap(studentId);
+      await query(
+        'INSERT INTO roadmaps (id, student_id, milestones) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+        [`rdm-${studentId}`, studentId, JSON.stringify(milestones)]
+      );
+      return res.json(milestones);
     }
     res.json(result.rows[0].milestones);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
+
+// Shared baseline roadmap generator — used on first GET and after assessments.
+async function generateDefaultRoadmap(studentId: string) {
+  const idSuffix = studentId.replace(/[^a-z0-9]/gi, '').slice(-8) || 'x';
+
+  // Fetch student's target role and recent assessment to customize the roadmap
+  const studentRes = await query('SELECT target_role FROM students WHERE id = $1', [studentId]);
+  const targetRole = studentRes.rows[0]?.target_role || 'Software Engineer';
+  
+  const assessRes = await query('SELECT category_scores FROM assessments WHERE student_id = $1 ORDER BY completed_at DESC LIMIT 1', [studentId]);
+  const weaknesses = assessRes.rows[0]?.category_scores 
+    ? JSON.stringify(assessRes.rows[0].category_scores) 
+    : 'Unknown (assume beginner level)';
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (apiKey && apiKey.length > 10) {
+    try {
+      console.log('🤖 Asking S.P.A.R.K AI to generate a personalized roadmap for:', targetRole);
+      const prompt = `
+You are an expert AI Career Coach. 
+Create a highly personalized 3-milestone learning roadmap for a student aiming to become a "${targetRole}". 
+Their current assessment scores by category are: ${weaknesses}. Focus on improving their lowest scores.
+Output EXACTLY valid JSON in this exact structure, with NO markdown formatting, NO backticks, NO extra text:
+[
+  {
+    "id": "rm-ai-1",
+    "title": "Milestone Title",
+    "description": "Why this helps.",
+    "estimatedHours": 20,
+    "completed": false,
+    "modules": [
+      { "id": "mo-ai-1", "title": "Course Name", "provider": "Coursera/NPTEL", "durationWeeks": 2, "completed": false }
+    ]
+  }
+]
+Must have exactly 3 milestones. Each milestone must have 1-2 modules.`;
+
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+      });
+
+      if (response.ok) {
+        const data: any = await response.json();
+        let text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          text = text.replace(/\x60\x60\x60json/g, '').replace(/\x60\x60\x60/g, '').trim();
+          const parsed = JSON.parse(text);
+          // Inject dynamic IDs
+          parsed.forEach((m: any, i: number) => {
+            m.id = `rm-ai-${idSuffix}-${i}`;
+            m.modules.forEach((mod: any, j: number) => {
+              mod.id = `mo-ai-${idSuffix}-${i}-${j}`;
+            });
+          });
+          console.log('✅ Gemini successfully generated a custom roadmap!');
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('❌ Gemini API failed, falling back to hardcoded roadmaps:', e);
+    }
+  }
+
+  // Fallback AI/ML
+  if (targetRole === 'AI/ML Specialist') {
+    return [
+      {
+        id: `rm-mlcore-${idSuffix}`,
+        title: 'Machine Learning Core & Math',
+        description: 'Solidify understanding of gradient descent, backprop, and loss functions.',
+        estimatedHours: 24,
+        completed: false,
+        modules: [
+          { id: `mo-math-${idSuffix}`, title: 'Mathematics for Machine Learning', provider: 'Coursera', durationWeeks: 3, completed: false }
+        ],
+      }
+    ];
+  }
+
+  // Fallback Cloud/DevOps Roadmap
+  return [
+    {
+      id: `rm-cloud-${idSuffix}`,
+      title: 'Cloud Infrastructure Bridge',
+      description: 'Bridge critical deficits in Docker and Kubernetes.',
+      estimatedHours: 24,
+      completed: false,
+      modules: [
+        { id: `mo-cc-${idSuffix}`, title: 'Cloud Computing (NPTEL)', provider: 'NPTEL', durationWeeks: 4, completed: false }
+      ],
+    }
+  ];
+}
 
 router.patch('/roadmaps/:studentId/toggle-module', async (req: Request, res: Response) => {
   const { milestoneId, moduleId } = req.body;
@@ -656,33 +849,103 @@ router.patch('/roadmaps/:studentId/toggle-module', async (req: Request, res: Res
 // ==========================================
 // 5. JOBS & OPPORTUNITIES
 // ==========================================
+function mapJobRow(r: any) {
+  return {
+    id: r.id,
+    title: r.title,
+    company: r.company,
+    companyLogo: r.company_logo,
+    location: r.location,
+    type: r.type,
+    stipendOrSalary: r.stipend_or_salary,
+    duration: r.duration,
+    openings: r.openings,
+    postedDate: r.posted_date,
+    deadline: r.deadline,
+    description: r.description,
+    requiredSkills: r.required_skills || [],
+    minCgpa: parseFloat(r.min_cgpa),
+    eligibleBranches: r.eligible_branches || [],
+    sourcePlatform: r.source_platform || 'Campus Direct',
+    externalUrl: r.external_url || undefined,
+    fetchedAt: r.fetched_at,
+    postedBy: r.posted_by || undefined,
+    postedByName: r.posted_by_name || r.company,
+    status: r.status || 'open',
+    updatedAt: r.updated_at,
+  };
+}
+
+// Public board: search + filter + pagination (?q&type&location&status&page&limit).
+// Recruiters: ?mine=1 (Bearer auth) returns ONLY their own postings, all statuses.
 router.get('/jobs', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM jobs ORDER BY posted_date DESC');
-    const jobs = result.rows.map(r => ({
-      id: r.id,
-      title: r.title,
-      company: r.company,
-      companyLogo: r.company_logo,
-      location: r.location,
-      type: r.type,
-      stipendOrSalary: r.stipend_or_salary,
-      duration: r.duration,
-      openings: r.openings,
-      postedDate: r.posted_date,
-      deadline: r.deadline,
-      description: r.description,
-      requiredSkills: r.required_skills || [],
-      minCgpa: parseFloat(r.min_cgpa),
-      eligibleBranches: r.eligible_branches || [],
-      sourcePlatform: r.source_platform || 'Campus Direct',
-      externalUrl: r.external_url || undefined,
-      fetchedAt: r.fetched_at,
-    }));
+    const mine = String(req.query.mine || '') === '1';
+    const search = String(req.query.q || '').trim();
+    const typeFilter = String(req.query.type || '').trim();
+    const locationFilter = String(req.query.location || '').trim();
+    const statusFilter = String(req.query.status || '').trim();
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limitRaw = parseInt(String(req.query.limit || ''), 10);
+    const limit = Math.min(100, Math.max(1, limitRaw || 20));
 
-    res.json(jobs);
+    const where: string[] = [];
+    const params: any[] = [];
+    let auth: { sub: string; email: string; role: string; name?: string } | null = null;
+
+    if (mine) {
+      const header = req.headers.authorization || '';
+      const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+      const { verifyToken } = await import('./auth');
+      auth = token ? verifyToken(token) : null;
+      if (!auth) {
+        return res.status(401).json({ error: 'Authentication required for ?mine=1.' });
+      }
+      params.push(auth.sub);
+      where.push(`posted_by = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search.toLowerCase()}%`);
+      const n = params.length;
+      where.push(`(LOWER(title) LIKE $${n} OR LOWER(company) LIKE $${n} OR LOWER(location) LIKE $${n} OR LOWER(description) LIKE $${n})`);
+    }
+    if (typeFilter) {
+      params.push(typeFilter);
+      where.push(`type = $${params.length}`);
+    }
+    if (locationFilter) {
+      params.push(`%${locationFilter.toLowerCase()}%`);
+      where.push(`LOWER(location) LIKE $${params.length}`);
+    }
+    if (statusFilter) {
+      params.push(statusFilter);
+      where.push(`status = $${params.length}`); // 'open' | 'closed' | 'filled'
+    } else if (String(req.query.includeUnavailable || '') === '1' && !mine) {
+      // Student board wants everything so closed/filled cards render a friendly
+      // 'no longer accepting applications' state instead of vanishing.
+    } else if (!mine) {
+      where.push(`status = 'open'`);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const countRes = await query(`SELECT count(*)::int AS n FROM jobs ${whereSql}`, params);
+    const total = countRes.rows[0].n;
+    params.push(limit, (page - 1) * limit);
+    const dataRes = await query(
+      `SELECT * FROM jobs ${whereSql} ORDER BY posted_date DESC NULLS LAST, created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    res.json({
+      jobs: dataRes.rows.map(mapJobRow),
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('GET /jobs failed:', error.message);
+    res.status(500).json({ error: 'Failed to load jobs.' });
   }
 });
 
@@ -694,18 +957,21 @@ router.post('/jobs', requireAuth, async (req: Request, res: Response) => {
   } = req.body;
 
   try {
-    const id = `job-${Date.now().toString().slice(-4)}`;
+    const recruiter = (req as any).user;
+    const id = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const result = await query(
       `INSERT INTO jobs (
         id, title, company, company_logo, location, type, stipend_or_salary,
-        duration, openings, deadline, description, required_skills, min_cgpa, eligible_branches
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        duration, openings, deadline, description, required_skills, min_cgpa, eligible_branches,
+        posted_by, posted_by_name, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'open')
       RETURNING *`,
       [
         id, title, company, companyLogo || null, location, type, stipendOrSalary,
         duration || null, openings || 1, deadline || null, description,
         JSON.stringify(requiredSkills || []), minCgpa || 6.0,
         JSON.stringify(eligibleBranches || []),
+        recruiter.sub, recruiter.name || company,
       ]
     );
 
@@ -719,9 +985,229 @@ router.post('/jobs', requireAuth, async (req: Request, res: Response) => {
       data: { jobId: job.id, company: job.company },
     });
 
-    res.json({ success: true, job });
+    res.json({ success: true, job: mapJobRow(job) });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error('POST /jobs failed:', error.message);
+    res.status(500).json({ error: 'Failed to post job.' });
+  }
+});
+
+// ── Job lifecycle (owner-only): edit / close / mark-filled / delete ─────────
+async function requireJobOwner(req: Request, res: Response): Promise<any | null> {
+  const jobId = req.params.jobId;
+  const jobRes = await query('SELECT * FROM jobs WHERE id = $1', [jobId]);
+  if (jobRes.rows.length === 0) {
+    res.status(404).json({ error: 'Job not found.' });
+    return null;
+  }
+  const job = jobRes.rows[0];
+  const recruiter = (req as any).user;
+  if (job.posted_by && job.posted_by !== recruiter.sub) {
+    res.status(403).json({ error: 'Only the recruiter who posted this job can manage it.' });
+    return null;
+  }
+  if (!job.posted_by) {
+    res.status(403).json({ error: 'This listing was synced from an external platform and cannot be managed here.' });
+    return null;
+  }
+  return job;
+}
+
+function notifyJobApplicants(jobId: string, jobTitle: string, company: string, title: string, message: string) {
+  // Non-blocking: informs every applicant on status change via notification + SSE.
+  (async () => {
+    const apps = await query(
+      `SELECT DISTINCT student_id FROM applications WHERE job_id = $1`,
+      [jobId]
+    );
+    for (const row of apps.rows) {
+      const studentUserId = await query(`SELECT id FROM users WHERE LOWER(email) = (SELECT LOWER(email) FROM students WHERE id = $1)`, [row.student_id]);
+      const uid = studentUserId.rows[0]?.id || row.student_id;
+      await query(
+        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, 'alert')`,
+        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, title, message]
+      ).catch(() => {});
+      emitEvent({
+        type: 'application_update',
+        title,
+        message,
+        targetUserId: uid,
+        data: { jobId },
+      });
+    }
+  })().catch(err => console.error('notifyJobApplicants failed:', err.message));
+}
+
+router.patch('/jobs/:jobId', requireAuth, async (req: Request, res: Response) => {
+  const job = await requireJobOwner(req, res);
+  if (!job) return;
+
+  const { title, company, location, type, stipendOrSalary, duration, openings, deadline, description, requiredSkills, minCgpa, eligibleBranches } = req.body || {};
+
+  try {
+    const result = await query(
+      `UPDATE jobs SET
+         title = COALESCE($1, title),
+         company = COALESCE($2, company),
+         location = COALESCE($3, location),
+         type = COALESCE($4, type),
+         stipend_or_salary = COALESCE($5, stipend_or_salary),
+         duration = COALESCE($6, duration),
+         openings = COALESCE($7, openings),
+         deadline = COALESCE($8, deadline),
+         description = COALESCE($9, description),
+         required_skills = COALESCE($10, required_skills),
+         min_cgpa = COALESCE($11, min_cgpa),
+         eligible_branches = COALESCE($12, eligible_branches),
+         status = 'open',
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $13
+       RETURNING *`,
+      [
+        title ?? null, company ?? null, location ?? null, type ?? null,
+        stipendOrSalary ?? null, duration ?? null,
+        openings !== undefined && openings !== null ? parseInt(String(openings), 10) || null : null,
+        deadline ?? null, description ?? null,
+        requiredSkills ? JSON.stringify(requiredSkills) : null,
+        minCgpa !== undefined && minCgpa !== null ? parseFloat(String(minCgpa)) || null : null,
+        eligibleBranches ? JSON.stringify(eligibleBranches) : null,
+        job.id,
+      ]
+    );
+
+    res.json({ success: true, job: mapJobRow(result.rows[0]) });
+  } catch (error: any) {
+    console.error('PATCH /jobs/:id failed:', error.message);
+    res.status(500).json({ error: 'Failed to update job.' });
+  }
+});
+
+// Close (unpublish) / reopen / mark-filled — one endpoint, explicit actions
+router.patch('/jobs/:jobId/status', requireAuth, async (req: Request, res: Response) => {
+  const job = await requireJobOwner(req, res);
+  if (!job) return;
+
+  const { status } = req.body || {};
+  if (!['open', 'closed', 'filled'].includes(status)) {
+    return res.status(400).json({ error: "status must be 'open', 'closed' or 'filled'." });
+  }
+
+  try {
+    const result = await query(
+      `UPDATE jobs SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
+      [status, job.id]
+    );
+    const updated = result.rows[0];
+
+    if (status !== 'open') {
+      notifyJobApplicants(
+        job.id, job.title, job.company,
+        status === 'filled' ? 'Position Filled' : 'Application Window Closed',
+        status === 'filled'
+          ? `Great news — ${job.title} at ${job.company} has been filled. Thank you for applying!`
+          : `${job.title} at ${job.company} is no longer accepting applications.`
+      );
+      emitEvent({
+        type: 'job_update',
+        title: status === 'filled' ? 'Position Filled' : 'Job Closed',
+        message: `${job.title} at ${job.company} — ${status === 'filled' ? 'position filled' : 'closed for applications'}`,
+        data: { jobId: job.id, status },
+      });
+    }
+
+    res.json({ success: true, job: mapJobRow(updated) });
+  } catch (error: any) {
+    console.error('PATCH /jobs/:id/status failed:', error.message);
+    res.status(500).json({ error: 'Failed to update job status.' });
+  }
+});
+
+router.delete('/jobs/:jobId', requireAuth, async (req: Request, res: Response) => {
+  const job = await requireJobOwner(req, res);
+  if (!job) return;
+
+  try {
+    const applicantCount = await query(`SELECT count(DISTINCT student_id)::int AS n FROM applications WHERE job_id = $1`, [job.id]);
+    if (applicantCount.rows[0].n > 0) {
+      // Keep the ATS history intact — closing is the correct operation when applicants exist.
+      return res.status(409).json({
+        error: `This job has ${applicantCount.rows[0].n} applicant(s). Close or mark it filled instead of deleting, so application history is preserved.`,
+      });
+    }
+
+    await query('DELETE FROM jobs WHERE id = $1', [job.id]);
+    res.json({ success: true, deleted: job.id });
+  } catch (error: any) {
+    console.error('DELETE /jobs/:id failed:', error.message);
+    res.status(500).json({ error: 'Failed to delete job.' });
+  }
+});
+
+// ── Bulk candidate actions (owner-only): shortlist/reject many at once ──────
+router.patch('/applications/bulk-status', requireAuth, async (req: Request, res: Response) => {
+  const { jobIds, ids, status } = req.body || {};
+  const targetIds: string[] = Array.isArray(ids) ? ids.map(String) : [];
+  const filterJobIds: string[] = Array.isArray(jobIds) ? jobIds.map(String) : [];
+
+  if (targetIds.length === 0 && filterJobIds.length === 0) {
+    return res.status(400).json({ error: 'Provide application ids[] or jobIds[] to update.' });
+  }
+  const allowed = ['Applied', 'Under Review', 'Shortlisted', 'Interview Scheduled', 'Offer Extended', 'Rejected'];
+  if (!allowed.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
+  }
+
+  try {
+    const recruiter = (req as any).user;
+    // Ownership enforced in SQL: only applications on jobs posted_by the caller move.
+    const result = await query(
+      `UPDATE applications a
+         SET status = $1,
+             updated_at = CURRENT_TIMESTAMP,
+             stage_history = a.stage_history || $2::jsonb
+       WHERE ($3::text[] IS NULL OR a.id = ANY($3::text[]))
+         AND ($4::text[] IS NULL OR a.job_id = ANY($4::text[]))
+         AND a.job_id IN (SELECT id FROM jobs WHERE posted_by = $5)
+       RETURNING id, student_id, student_name, job_title, company`,
+      [
+        status,
+        JSON.stringify([{ stage: status, date: new Date().toISOString().split('T')[0], note: `Bulk update to ${status} by recruiter` }]),
+        targetIds.length ? targetIds : null,
+        filterJobIds.length ? filterJobIds : null,
+        recruiter.sub,
+      ]
+    );
+
+    // Notify every affected student (best-effort, non-blocking)
+    for (const row of result.rows) {
+      const uidRes = await query(
+        `SELECT u.id FROM users u WHERE LOWER(u.email) = (SELECT LOWER(email) FROM students WHERE id = $1)`,
+        [row.student_id]
+      ).catch(() => ({ rows: [] as any[] }));
+      const uid = uidRes.rows[0]?.id || row.student_id;
+      await query(
+        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
+        [
+          `notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          uid,
+          `Application ${status}`,
+          `Your application for ${row.job_title} at ${row.company} moved to: ${status}`,
+          status === 'Rejected' ? 'alert' : 'success',
+        ]
+      ).catch(() => {});
+      emitEvent({
+        type: 'application_update',
+        title: `Application ${status}`,
+        message: `Your application for ${row.job_title} at ${row.company} moved to: ${status}`,
+        targetUserId: uid,
+        data: { status },
+      });
+    }
+
+    res.json({ success: true, updated: result.rowCount, status });
+  } catch (error: any) {
+    console.error('bulk-status failed:', error.message);
+    res.status(500).json({ error: 'Bulk update failed.' });
   }
 });
 
@@ -730,7 +1216,33 @@ router.post('/jobs', requireAuth, async (req: Request, res: Response) => {
 // ==========================================
 router.get('/applications', async (req: Request, res: Response) => {
   try {
-    const result = await query('SELECT * FROM applications ORDER BY applied_date DESC');
+    // ?studentId= scopes to one student (personal tracker).
+    // ?mine=1 (recruiter JWT) scopes to applications on the recruiter's OWN jobs.
+    // With neither, industry/college dashboards get the global ATS view.
+    const studentIdFilter = String(req.query.studentId || '').trim();
+    const mine = String(req.query.mine || '') === '1';
+
+    let result;
+    if (mine) {
+      const header = req.headers.authorization || '';
+      const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+      const { verifyToken } = await import('./auth');
+      const auth = token ? verifyToken(token) : null;
+      if (!auth) {
+        return res.status(401).json({ error: 'Authentication required for ?mine=1.' });
+      }
+      result = await query(
+        `SELECT a.* FROM applications a
+         JOIN jobs j ON j.id = a.job_id
+         WHERE j.posted_by = $1
+         ORDER BY a.applied_date DESC`,
+        [auth.sub]
+      );
+    } else if (studentIdFilter) {
+      result = await query('SELECT * FROM applications WHERE student_id = $1 ORDER BY applied_date DESC', [studentIdFilter]);
+    } else {
+      result = await query('SELECT * FROM applications ORDER BY applied_date DESC');
+    }
     const apps = result.rows.map(r => ({
       id: r.id,
       jobId: r.job_id,
@@ -738,7 +1250,10 @@ router.get('/applications', async (req: Request, res: Response) => {
       company: r.company,
       studentId: r.student_id,
       studentName: r.student_name,
-      appliedDate: r.applied_date,
+      // pg DATE arrives as a JS Date → serialize as 'YYYY-MM-DD', not raw ISO datetime
+      appliedDate: typeof r.applied_date === 'string'
+        ? r.applied_date
+        : new Date(r.applied_date).toLocaleDateString('en-CA'),  // en-CA = YYYY-MM-DD
       status: r.status,
       aiMatchScore: r.ai_match_score,
       notes: r.notes,
@@ -755,7 +1270,14 @@ router.get('/applications', async (req: Request, res: Response) => {
 router.post('/applications', async (req: Request, res: Response) => {
   const { jobId, jobTitle, company, studentId, studentName, aiMatchScore, notes, attachedScorecardUrl, attachedResumeUrl } = req.body;
   try {
-    const id = `app-${Date.now().toString().slice(-4)}`;
+    // A closed/filled job must never accept new applications.
+    const jobState = await query(`SELECT status, title, company FROM jobs WHERE id = $1`, [jobId]);
+    if (jobState.rows.length > 0 && jobState.rows[0].status && jobState.rows[0].status !== 'open') {
+      return res.status(409).json({
+        error: `${jobState.rows[0].title} at ${jobState.rows[0].company} is no longer accepting applications.`,
+      });
+    }
+    const id = `app-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const initialStatus = (aiMatchScore && aiMatchScore >= 80) ? 'Shortlisted' : 'Applied';
     const initialStageHistory = JSON.stringify([
       { stage: initialStatus, date: new Date().toISOString().split('T')[0], note: 'Application registered on S.P.A.R.K.' }
@@ -779,7 +1301,7 @@ router.post('/applications', async (req: Request, res: Response) => {
       `INSERT INTO notifications (id, user_id, title, message, type)
        VALUES ($1, $2, $3, $4, $5)`,
       [
-        `notif-${Date.now().toString().slice(-4)}`, 
+        `notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, 
         studentId,
         'Application Submitted',
         `Your application for ${jobTitle} at ${company} was submitted. Current stage: ${initialStatus}`,
@@ -894,7 +1416,7 @@ router.get('/mous', async (req: Request, res: Response) => {
 router.post('/mous', requireAuth, async (req: Request, res: Response) => {
   const { collegeName, companyName, title, focusArea, validUntil, keyObjectives, digitalSignatureHash } = req.body;
   try {
-    const id = `mou-${Date.now().toString().slice(-4)}`;
+    const id = `mou-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const result = await query(
       `INSERT INTO mous (
         id, college_name, company_name, title, focus_area, valid_until, key_objectives, digital_signature_hash
@@ -949,7 +1471,7 @@ router.get('/problems', async (req: Request, res: Response) => {
 router.post('/problems', async (req: Request, res: Response) => {
   const { title, company, domain, description, rewardOrGrant, deadline, tags } = req.body;
   try {
-    const id = `prob-${Date.now().toString().slice(-4)}`;
+    const id = `prob-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const result = await query(
       `INSERT INTO problem_statements (
         id, title, company, domain, description, reward_or_grant, deadline, tags
@@ -967,12 +1489,117 @@ router.post('/problems', async (req: Request, res: Response) => {
 // ==========================================
 // 9. NOTIFICATIONS
 // ==========================================
-router.get('/notifications', async (req: Request, res: Response) => {
+router.get('/notifications', requireAuth, async (req: Request, res: Response) => {
+  // Scope to the signed-in user (JWT sub = users.id; email also accepted so
+  // legacy notification rows keyed by email still show).
+  const user = (req as any).user;
   try {
-    const result = await query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20');
+    const result = await query(
+      'SELECT * FROM notifications WHERE user_id = $1 OR user_id = $2 ORDER BY created_at DESC LIMIT 20',
+      [user.sub, user.email]
+    );
     res.json(result.rows);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── One-click job-alert unsubscribe (link in every digest email) ────────────
+// HMAC-signed with the same secret as JWT_SECRET so the link can't be forged.
+router.get('/unsubscribe-alerts', async (req: Request, res: Response) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  const token = String(req.query.token || '').trim();
+  if (!email || !token) {
+    return res.status(400).send('Invalid unsubscribe link.');
+  }
+
+  const crypto = await import('crypto');
+  const expected = crypto
+    .createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-unsubscribe-secret')
+    .update(email)
+    .digest('hex')
+    .slice(0, 32);
+
+  if (token !== expected) {
+    return res.status(403).send('This unsubscribe link is invalid or expired.');
+  }
+
+  try {
+    const result = await query(
+      `UPDATE users SET job_alerts_enabled = FALSE WHERE LOWER(email) = $1 RETURNING email`,
+      [email]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).send('No account found for this email.');
+    }
+    await query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'JOB_ALERTS_UNSUBSCRIBED', '{}')`,
+      [email]
+    ).catch(() => {});
+    res.type('html').send(
+      '<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px 20px;background:#0b0f19;color:#e2e8f0;">'
+      + '<h1 style="color:#6ee7b7;">✓ Unsubscribed</h1><p>You will no longer receive daily job-alert emails from S.P.A.R.K.</p>'
+      + '<p style="color:#64748b;font-size:12px;">You can re-enable alerts anytime from your dashboard.</p></body></html>'
+    );
+  } catch (error: any) {
+    console.error('Unsubscribe failed:', error.message);
+    res.status(500).send('Could not process the unsubscribe request.');
+  }
+});
+
+// Manual digest trigger for testing: POST /api/job-alerts/run?secret=<JWT_SECRET>
+router.post('/job-alerts/run', async (req: Request, res: Response) => {
+  const secret = process.env.JWT_SECRET?.trim();
+  const provided = String(req.query.secret || req.body?.secret || '');
+  if (!secret || provided !== secret) {
+    return res.status(403).json({ error: 'Admin secret required.' });
+  }
+  try {
+    const { sendJobAlertDigest } = await import('./jobAlerts');
+    const result = await sendJobAlertDigest();
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Student job-alerts preference (dashboard toggle ↔ email unsubscribe) ────
+router.get('/me/job-alerts', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const r = await query(`SELECT job_alerts_enabled FROM users WHERE id = $1`, [user.sub]);
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+    res.json({ jobAlertsEnabled: r.rows[0].job_alerts_enabled !== false });
+  } catch (error: any) {
+    console.error('GET /me/job-alerts failed:', error.message);
+    res.status(500).json({ error: 'Failed to load preference.' });
+  }
+});
+
+router.patch('/me/job-alerts', requireAuth, async (req: Request, res: Response) => {
+  const { enabled } = req.body || {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled (boolean) is required.' });
+  }
+  try {
+    const user = (req as any).user;
+    const r = await query(
+      `UPDATE users SET job_alerts_enabled = $1 WHERE id = $2 RETURNING job_alerts_enabled`,
+      [enabled, user.sub]
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+    await query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'JOB_ALERTS_SETTING', $2)`,
+      [user.email, JSON.stringify({ enabled })]
+    ).catch(() => {});
+    res.json({ success: true, jobAlertsEnabled: r.rows[0].job_alerts_enabled });
+  } catch (error: any) {
+    console.error('PATCH /me/job-alerts failed:', error.message);
+    res.status(500).json({ error: 'Failed to update preference.' });
   }
 });
 
@@ -1012,7 +1639,7 @@ router.post('/auth/register-send-otp', async (req: Request, res: Response) => {
   try {
     // Generate secure 6-digit numeric OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const id = `reg-otp-${Date.now().toString().slice(-6)}`;
+    const id = `reg-otp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Remove any previous pending registration OTPs for this email
@@ -1040,13 +1667,15 @@ router.post('/auth/register-send-otp', async (req: Request, res: Response) => {
 
     await query(
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
-      [normalizedEmail, 'REGISTRATION_OTP_SENT', JSON.stringify({ messageId: mailResult.messageId })]
+      [normalizedEmail, 'REGISTRATION_OTP_SENT', JSON.stringify({ messageId: mailResult.messageId, devFallback: !!mailResult.devOtp })]
     );
 
     res.json({
       success: true,
       message: `Verification code successfully sent to ${normalizedEmail}`,
       expiresInMinutes: 10,
+      // Dev convenience only: lets the local UI display the OTP when SMTP is unreachable.
+      ...(mailResult.devOtp && process.env.NODE_ENV !== 'production' ? { devOtp: mailResult.devOtp } : {}),
     });
   } catch (error: any) {
     console.error('Registration OTP dispatch error:', error);
@@ -1111,11 +1740,18 @@ router.post('/register', async (req: Request, res: Response) => {
     jurisdiction,
   } = req.body;
 
-  if (!email) {
+  if (!email || typeof email !== 'string') {
     return res.status(400).json({ error: 'Email is required for registration.' });
+  }
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Full name is required for registration.' });
   }
 
   const normalizedEmail = email.trim().toLowerCase();
+
+  // Declared outside try so the catch block can always release the pooled
+  // connection, even when a failure happens mid-transaction.
+  let client: any = null;
 
   try {
     // Verify that this email has an approved OTP verification
@@ -1132,30 +1768,56 @@ router.post('/register', async (req: Request, res: Response) => {
       });
     }
 
-    const userId = `usr-${Date.now().toString().slice(-6)}`;
+    // ── Duplicate-account guard ────────────────────────────────────────────
+    // A credential-bearing account must never be silently overwritten by a
+    // public signup. Trusted internal flows (seeding/admin tooling) may pass
+    // x-registration-override: <REGISTRATION_OVERRIDE_KEY> to overwrite —
+    // which always triggers a security-alert email to the account owner.
+    const existingUser = await query(
+      `SELECT id, name FROM users WHERE LOWER(email) = $1 LIMIT 1`,
+      [normalizedEmail]
+    );
+    const isExistingAccount = existingUser.rows.length > 0;
+    const overrideKey = process.env.REGISTRATION_OVERRIDE_KEY?.trim();
+    const overrideAllowed = !!overrideKey && req.get('x-registration-override') === overrideKey;
+
+    if (isExistingAccount && !overrideAllowed) {
+      return res.status(409).json({
+        error: 'An account with this email already exists. Please sign in or reset your password instead of registering again.',
+      });
+    }
+
+    // Everything below runs in ONE transaction: users + students (or alumni)
+    // rows commit atomically or not at all — no orphaned half-registrations.
+    client = await pool.connect();
+    const userId = `usr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const avatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name || 'User')}`;
 
     // Hash the password with bcrypt before persisting (never store plaintext)
     const passwordHash = await hashPassword(password || 'spark-default-2026');
 
-    // Upsert User
-    await query(
-      `INSERT INTO users (id, name, email, role, avatar, password_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (email) DO UPDATE SET name = $2, role = $4, avatar = $5,
-         password_hash = COALESCE($6, users.password_hash)
-       RETURNING *`,
-      [userId, name, normalizedEmail, role || 'student', avatar, passwordHash]
-    );
+    await client.query('BEGIN');
+    try {
+      const userRes = await client.query(
+        `INSERT INTO users (id, name, email, role, avatar, password_hash)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role,
+           avatar = EXCLUDED.avatar,
+           password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)
+         RETURNING *`,
+        [userId, name.trim(), normalizedEmail, role || 'student', avatar, passwordHash]
+      );
+      // The row's real id (on re-registration the existing id is preserved)
+      const effectiveUserId = userRes.rows[0].id;
 
     let studentRecord = null;
     if (role === 'student') {
-      const studentId = `std-${Date.now().toString().slice(-6)}`;
+      const studentId = `std-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       const semNumber = parseInt(semester, 10) || 1;
       const cgpaNumber = parseFloat(cgpa) || 7.5;
       const gradYear = parseInt(graduationYear, 10) || (new Date().getFullYear() + 2);
 
-      const studentRes = await query(
+      const studentRes = await client.query(
         `INSERT INTO students (
           id, user_id, name, email, avatar, college, degree, branch, semester, cgpa,
           graduation_year, target_role, bio, resume_uploaded, resume_name,
@@ -1167,9 +1829,9 @@ router.post('/register', async (req: Request, res: Response) => {
         RETURNING *`,
         [
           studentId,
-          userId,
-          name,
-          email,
+          effectiveUserId,
+          name.trim(),
+          normalizedEmail,
           avatar,
           college || 'Institute of Engineering & Technology',
           degree || 'B.Tech',
@@ -1183,17 +1845,73 @@ router.post('/register', async (req: Request, res: Response) => {
       );
 
       studentRecord = studentRes.rows[0];
-    }
+      }
+      if (role === 'alumni') {
+        const alumniId = `alum-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        // Schema requires a valid alumni_applications FK — auto-create an
+        // approved application record (the email is already OTP-verified).
+        const appId = `alumapp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        await client.query(
+          `INSERT INTO alumni_applications (
+             id, full_name, email, college_id, college_name, degree, graduation_year,
+             company, designation, expertise, status, review_note, reviewed_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'approved', 'Auto-approved via verified registration.', CURRENT_TIMESTAMP)
+           ON CONFLICT (id) DO NOTHING`,
+          [appId, name.trim(), normalizedEmail, 'inst-default',
+           college || 'Institute of Engineering & Technology', 'B.Tech', new Date().getFullYear() - 4,
+           company || 'Enterprise Corp', designation || 'Alumni / Mentor',
+           JSON.stringify([targetRole || 'Industry Insights'])]
+        );
+        await client.query(
+          `INSERT INTO alumni (id, application_id, name, email, phone, college_id, college_name, degree, graduation_year, company, designation, expertise, mentor_capacity)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           ON CONFLICT (email) DO NOTHING`,
+          [
+            alumniId,
+            appId,
+            name.trim(),
+            normalizedEmail,
+            'Not provided',
+            'inst-default',
+            college || 'Institute of Engineering & Technology',
+            'B.Tech',
+            new Date().getFullYear() - 4,
+            company || 'Enterprise Corp',
+            designation || 'Alumni / Mentor',
+            JSON.stringify([targetRole || 'Industry Insights']),
+            10
+          ]
+        );
+      }
+      
 
-    await query(
-      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
-      [userId, 'USER_REGISTERED', JSON.stringify({ role, name, email, college, company, department })]
-    );
+      await client.query(
+        `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
+        [effectiveUserId, 'USER_REGISTERED', JSON.stringify({ role: role || 'student', name: name.trim(), email: normalizedEmail, college, company, department })]
+      );
 
-    res.json({
-      success: true,
-      role,
-      user: { id: userId, name, email, role, avatar },
+      if (isExistingAccount) {
+        await client.query(
+          `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
+          [effectiveUserId, 'ACCOUNT_OVERWRITTEN', JSON.stringify({ via: 'registration-override', email: normalizedEmail })]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      if (isExistingAccount) {
+        // Notify the previous account holder — non-blocking for the response.
+        sendSecurityAlertEmail({
+          toEmail: normalizedEmail,
+          userName: String(existingUser.rows[0]?.name || 'there'),
+          reason: 'account-overwritten',
+        }).catch(() => { /* alert delivery must never fail the request */ });
+      }
+
+      res.json({
+        success: true,
+        role: role || 'student',
+        user: { id: effectiveUserId, name: name.trim(), email: normalizedEmail, role: role || 'student', avatar },
       student: studentRecord ? {
         id: studentRecord.id,
         userId: studentRecord.user_id,
@@ -1216,9 +1934,16 @@ router.post('/register', async (req: Request, res: Response) => {
         readinessScore: studentRecord.readiness_score,
       } : null,
     });
+    } finally {
+      client.release();
+    }
   } catch (error: any) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: error.message || 'Registration failed' });
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch { /* connection may be dead */ }
+      client.release();
+    }
+    console.error('Registration error:', error.message);
+    res.status(500).json({ error: 'Registration failed. Please try again.' });
   }
 });
 
@@ -1247,7 +1972,7 @@ router.post('/auth/forgot-password', async (req: Request, res: Response) => {
 
     // Generate random secure 6-digit numeric OTP (e.g. 748291)
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const id = `otp-${Date.now().toString().slice(-6)}`;
+    const id = `otp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Clear any previous pending OTPs for this email to prevent collisions
@@ -1275,13 +2000,15 @@ router.post('/auth/forgot-password', async (req: Request, res: Response) => {
 
     await query(
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
-      [normalizedEmail, 'OTP_SENT_VIA_GMAIL', JSON.stringify({ messageId: mailResult.messageId })]
+      [normalizedEmail, 'OTP_SENT_VIA_GMAIL', JSON.stringify({ messageId: mailResult.messageId, devFallback: !!mailResult.devOtp })]
     );
 
     res.json({
       success: true,
       message: `A 6-digit verification code has been successfully emailed to ${normalizedEmail}.`,
       expiresInMinutes: 10,
+      // Dev convenience only: lets the local UI display the OTP when SMTP is unreachable.
+      ...(mailResult.devOtp && process.env.NODE_ENV !== 'production' ? { devOtp: mailResult.devOtp } : {}),
     });
   } catch (error: any) {
     console.error('Forgot password error:', error);
@@ -1377,6 +2104,13 @@ router.post('/auth/reset-password', async (req: Request, res: Response) => {
       userName,
     });
 
+    // Security alert: a credential change must always notify the account owner.
+    await sendSecurityAlertEmail({
+      toEmail: normalizedEmail,
+      userName,
+      reason: 'password-changed',
+    }).catch(() => { /* alert delivery must never fail the reset */ });
+
     await query(
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
       [normalizedEmail, 'PASSWORD_RESET_COMPLETED', JSON.stringify({ timestamp: new Date() })]
@@ -1471,7 +2205,7 @@ const ALLOWED_ADMIN_TABLES = [
   'audit_logs'
 ];
 
-router.get('/admin/tables-summary', async (req: Request, res: Response) => {
+router.get('/admin/tables-summary', requireAuth, async (req: Request, res: Response) => {
   try {
     const summary: any[] = [];
     for (const table of ALLOWED_ADMIN_TABLES) {
@@ -1491,7 +2225,7 @@ router.get('/admin/tables-summary', async (req: Request, res: Response) => {
   }
 });
 
-router.get('/admin/table-data/:tableName', async (req: Request, res: Response) => {
+router.get('/admin/table-data/:tableName', requireAuth, async (req: Request, res: Response) => {
   const tableName = String(req.params.tableName);
   if (!ALLOWED_ADMIN_TABLES.includes(tableName)) {
     return res.status(400).json({ error: 'Invalid or restricted table.' });
@@ -1580,7 +2314,7 @@ router.put('/admin/table-data/:tableName/:id', requireAuth, async (req: Request,
 });
 
 // Delete a row from a table (Browser Admin GUI)
-router.delete('/admin/table-data/:tableName/:id', async (req: Request, res: Response) => {
+router.delete('/admin/table-data/:tableName/:id', requireAuth, async (req: Request, res: Response) => {
   const tableName = String(req.params.tableName);
   const id = String(req.params.id);
   if (!ALLOWED_ADMIN_TABLES.includes(tableName)) {
@@ -2435,6 +3169,27 @@ router.post('/mentorship/request', async (req: Request, res: Response) => {
   }
 
   try {
+    // Demo-safety: make sure the student also exists as a real user/student row
+    // so the mentor can accept and chat without hitting foreign-data gaps.
+    const userExists = await query('SELECT id FROM users WHERE id = $1 OR LOWER(email) = LOWER($2) LIMIT 1', [studentId, studentId]);
+    if (userExists.rows.length === 0 && studentId.includes('@')) {
+      const uid = `usr-${Date.now().toString().slice(-6)}`;
+      await query(
+        `INSERT INTO users (id, name, email, role, avatar) VALUES ($1,$2,$3,'student',$4)
+         ON CONFLICT (email) DO NOTHING`,
+        [uid, studentName || 'Student', String(studentId).toLowerCase(), `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(studentName || 'Student')}`]
+      );
+      const stRes = await query('SELECT id FROM students WHERE LOWER(email) = LOWER($1) LIMIT 1', [studentId]);
+      if (stRes.rows.length === 0) {
+        await query(
+          `INSERT INTO students (id, user_id, name, email, avatar, college, degree, branch, semester, cgpa, graduation_year, target_role)
+           VALUES ($1,$2,$3,$4,$5,$6,'B.Tech','Computer Science & Engineering',6,7.5,2027,'Full Stack Cloud Engineer')
+           ON CONFLICT (email) DO NOTHING`,
+          [`std-${Date.now().toString().slice(-6)}`, uid, studentName || 'Student', String(studentId).toLowerCase(), `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(studentName || 'Student')}`, studentCollege || 'Institute of Engineering & Technology']
+        );
+      }
+    }
+
     // Duplicate guard: one pending request per student→mentor pair
     const dup = await query(
       `SELECT id FROM mentorship_requests WHERE alumni_id = $1 AND student_id = $2 AND status = 'pending' LIMIT 1`,

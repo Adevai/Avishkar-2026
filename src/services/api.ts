@@ -28,6 +28,8 @@ export function setToken(token: string | null) {
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
   } catch { /* storage unavailable */ }
+  // Let the React tree (AppContext) re-sync identity on login/logout.
+  try { window.dispatchEvent(new Event('spark:session')); } catch { /* SSR */ }
 }
 
 export function clearSession() {
@@ -94,6 +96,17 @@ export const api = {
     if (!res.ok) throw new Error(data.error || 'Login failed');
     setToken(data.token);
     return data;
+  },
+
+  /** Authenticated "who am I" — resolves the student profile for the JWT session. */
+  async getStudentMe(): Promise<StudentProfile | null> {
+    const res = await authFetch(`${API_BASE}/students/me`);
+    if (!res.ok) return null;
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
   },
 
   async getStudents(): Promise<StudentProfile[]> {
@@ -200,9 +213,95 @@ export const api = {
     return await res.json();
   },
 
-  async getJobs(): Promise<JobOpportunity[]> {
-    const res = await fetch(`${API_BASE}/jobs`);
+  async getJobs(params?: { q?: string; type?: string; location?: string; page?: number; limit?: number; mine?: boolean; includeUnavailable?: boolean }): Promise<{ jobs: JobOpportunity[]; page: number; limit: number; total: number; totalPages: number }> {
+    const qs = new URLSearchParams();
+    if (params?.q) qs.set('q', params.q);
+    if (params?.type) qs.set('type', params.type);
+    if (params?.location) qs.set('location', params.location);
+    if (params?.page) qs.set('page', String(params.page));
+    if (params?.limit) qs.set('limit', String(params.limit));
+    if (params?.mine) qs.set('mine', '1');
+    if (params?.includeUnavailable) qs.set('includeUnavailable', '1');
+    const res = await authFetch(`${API_BASE}/jobs${qs.toString() ? `?${qs.toString()}` : ''}`);
     if (!res.ok) throw new Error('Failed to fetch jobs');
+    const data = await res.json();
+    // Back-compat: the legacy endpoint returned a bare array
+    if (Array.isArray(data)) return { jobs: data, page: 1, limit: data.length, total: data.length, totalPages: 1 };
+    return data;
+  },
+
+  async updateJob(jobId: string, patch: Partial<JobOpportunity>): Promise<JobOpportunity> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update job');
+    }
+    const data = await res.json();
+    return data.job;
+  },
+
+  async setJobStatus(jobId: string, status: 'open' | 'closed' | 'filled'): Promise<JobOpportunity> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update job status');
+    }
+    const data = await res.json();
+    return data.job;
+  },
+
+  async deleteJob(jobId: string): Promise<{ success: boolean; deleted: string }> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to delete job');
+    }
+    return await res.json();
+  },
+
+  async getMyJobApplications(): Promise<JobApplication[]> {
+    const res = await authFetch(`${API_BASE}/applications?mine=1`);
+    if (!res.ok) throw new Error('Failed to fetch candidate applications');
+    return await res.json();
+  },
+
+  async bulkUpdateApplicationStatus(payload: { ids?: string[]; jobIds?: string[]; status: string }): Promise<{ success: boolean; updated: number; status: string }> {
+    const res = await authFetch(`${API_BASE}/applications/bulk-status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Bulk update failed');
+    }
+    return await res.json();
+  },
+
+  async getJobAlertsPreference(): Promise<{ jobAlertsEnabled: boolean }> {
+    const res = await authFetch(`${API_BASE}/me/job-alerts`);
+    if (!res.ok) return { jobAlertsEnabled: true };
+    return await res.json();
+  },
+
+  async setJobAlertsPreference(enabled: boolean): Promise<{ success: boolean; jobAlertsEnabled: boolean }> {
+    const res = await authFetch(`${API_BASE}/me/job-alerts`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to update preference');
+    }
     return await res.json();
   },
 
@@ -217,8 +316,13 @@ export const api = {
     return data.job;
   },
 
-  async getApplications(): Promise<JobApplication[]> {
-    const res = await fetch(`${API_BASE}/applications`);
+  /**
+   * Fetch applications. Pass studentId to scope to one student; omit for the
+   * global feed (industry/TPO portals).
+   */
+  async getApplications(studentId?: string): Promise<JobApplication[]> {
+    const qs = studentId ? `?studentId=${encodeURIComponent(studentId)}` : '';
+    const res = await authFetch(`${API_BASE}/applications${qs}`);
     if (!res.ok) throw new Error('Failed to fetch applications');
     return await res.json();
   },
@@ -313,7 +417,9 @@ export const api = {
   },
 
   async getNotifications(): Promise<any[]> {
-    const res = await fetch(`${API_BASE}/notifications`);
+    // Authenticated when a session exists (server scopes to that user);
+    // falls back to unauthenticated legacy route when logged out.
+    const res = await authFetch(`${API_BASE}/notifications`);
     if (!res.ok) return [];
     return await res.json();
   },
@@ -329,7 +435,7 @@ export const api = {
     return data.answer;
   },
 
-  async requestRegistrationOtp(email: string, name?: string): Promise<{ success: boolean; message: string }> {
+  async requestRegistrationOtp(email: string, name?: string): Promise<{ success: boolean; message: string; devOtp?: string }> {
     const res = await fetch(`${API_BASE}/auth/register-send-otp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -351,7 +457,7 @@ export const api = {
     return data;
   },
 
-  async requestPasswordResetOtp(email: string): Promise<{ success: boolean; message: string }> {
+  async requestPasswordResetOtp(email: string): Promise<{ success: boolean; message: string; devOtp?: string }> {
     const res = await fetch(`${API_BASE}/auth/forgot-password`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -363,3 +363,325 @@ describe('Verification review queue (government role)', () => {
     expect(res.status).toBe(400);
   });
 });
+
+// ── REGISTRATION DUPLICATE GUARD (regression: silent account overwrite) ─────
+describe('POST /api/register (duplicate account guard)', () => {
+  const dupEmail = `e2e-dup-${Date.now()}@spark.test`;
+  let userId = '';
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) LIKE 'e2e-dup-%' OR LOWER(email) LIKE 'e2e-nootp-%'`).catch(() => {});
+    await pool.query(`DELETE FROM students WHERE LOWER(email) LIKE 'e2e-dup-%'`).catch(() => {});
+    await pool.query(`DELETE FROM users WHERE LOWER(email) LIKE 'e2e-dup-%'`).catch(() => {});
+  });
+
+  async function verifyFreshOtp(email: string): Promise<string | undefined> {
+    await request(app).post('/api/auth/register-send-otp').send({ email, name: 'E2E Dup' });
+    const otpRow = await pool.query(
+      'SELECT otp FROM otp_verifications WHERE LOWER(email) = $1 ORDER BY created_at DESC LIMIT 1',
+      [email]
+    );
+    const otp = otpRow.rows[0]?.otp as string | undefined;
+    if (!otp) return undefined;
+    const verify = await request(app).post('/api/auth/register-verify-otp').send({ email, otp });
+    expect(verify.status).toBe(200);
+    return otp;
+  }
+
+  dbIt('creates a fresh account through the full OTP flow', async () => {
+    await verifyFreshOtp(dupEmail);
+
+    const reg = await request(app).post('/api/register').send({
+      role: 'student', name: 'E2E Dup', email: dupEmail, password: 'DupPass@2026',
+      college: 'E2E College', degree: 'B.Tech', branch: 'CSE', semester: 3,
+      cgpa: 7.5, graduationYear: 2027, targetRole: 'Full Stack Cloud Engineer',
+    });
+    expect(reg.status).toBe(200);
+    expect(reg.body.success).toBe(true);
+    userId = reg.body.user.id;
+
+    const user = await pool.query('SELECT id, name FROM users WHERE LOWER(email) = $1', [dupEmail]);
+    expect(user.rows.length).toBe(1);
+    expect(user.rows[0].name).toBe('E2E Dup');
+  });
+
+  dbIt('rejects re-registration of the same email with 409 and leaves the original intact', async () => {
+    await verifyFreshOtp(dupEmail);
+
+    const reg = await request(app).post('/api/register').send({
+      role: 'student', name: 'E2E Dup Impostor', email: dupEmail, password: 'Hijack@2026',
+      college: 'E2E College', degree: 'B.Tech', branch: 'CSE', semester: 1,
+      cgpa: 6.0, graduationYear: 2030, targetRole: 'Full Stack Cloud Engineer',
+    });
+    expect(reg.status).toBe(409);
+    expect(String(reg.body.error)).toMatch(/already exists/i);
+
+    // Original row untouched: same id, same name, password NOT replaced
+    const user = await pool.query('SELECT id, name FROM users WHERE LOWER(email) = $1', [dupEmail]);
+    expect(user.rows.length).toBe(1);
+    expect(user.rows[0].id).toBe(userId);
+    expect(user.rows[0].name).toBe('E2E Dup');
+  });
+
+  dbIt('still enforces the OTP gate before anything else (403 without OTP)', async () => {
+    const reg = await request(app).post('/api/register').send({
+      role: 'student', name: 'No Otp', email: `e2e-nootp-${Date.now()}@spark.test`, password: 'Whatever@1',
+    });
+    expect(reg.status).toBe(403);
+  });
+});
+
+// ── JOB OWNERSHIP + LIFECYCLE + PAGINATION ───────────────────────────────────
+describe('Job ownership, lifecycle & pagination', () => {
+  let recruiterToken = '';
+  let otherToken = '';
+  let ownedJobId = '';
+  const jobIds: string[] = [];
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    const { hashPassword } = await import('./auth');
+    const stamp = Date.now();
+    for (const [suffix, name] of [[`own-${stamp}`, 'E2E Recruiter Own'], [`other-${stamp}`, 'E2E Recruiter Other']] as const) {
+      const email = `e2e-rec-${suffix}@corp.test`;
+      const hash = await hashPassword('Recruiter!2026');
+      await pool.query(
+        `INSERT INTO users (id, name, email, role, password_hash)
+         VALUES ($1, $2, $3, 'industry', $4)
+         ON CONFLICT (email) DO UPDATE SET password_hash = $4`,
+        [`usr-e2e-rec-${suffix}`, name, email, hash]
+      );
+      const res = await request(app).post('/api/login').send({ email, password: 'Recruiter!2026' });
+      if (suffix.startsWith('own')) recruiterToken = res.body.token;
+      else otherToken = res.body.token;
+    }
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    for (const id of jobIds) {
+      await pool.query(`DELETE FROM applications WHERE job_id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM jobs WHERE id = $1`, [id]).catch(() => {});
+    }
+    await pool.query(`DELETE FROM users WHERE email LIKE 'e2e-rec-own-%@corp.test' OR email LIKE 'e2e-rec-other-%@corp.test'`).catch(() => {});
+    await pool.query(`DELETE FROM students WHERE email LIKE 'e2e-cand-%@spark.test'`).catch(() => {});
+  });
+
+  async function postJob(token: string, title: string): Promise<string> {
+    const res = await request(app).post('/api/jobs').set('Authorization', `Bearer ${token}`).send({
+      title, company: 'E2E Corp', location: 'Pune', type: 'Internship',
+      stipendOrSalary: '₹30,000 / month', openings: 2, description: 'E2E role',
+      requiredSkills: [{ name: 'React.js', weight: 0.5, minScore: 60 }],
+      minCgpa: 6.0, eligibleBranches: ['Computer Science & Engineering'],
+    });
+    expect(res.status).toBe(200);
+    jobIds.push(res.body.job.id);
+    return res.body.job.id;
+  }
+
+  dbIt('POST /jobs records the recruiter as owner', async () => {
+    ownedJobId = await postJob(recruiterToken, 'E2E Owned Role A');
+    const row = await pool.query('SELECT posted_by, posted_by_name, status FROM jobs WHERE id = $1', [ownedJobId]);
+    expect(row.rows[0].status).toBe('open');
+    expect(row.rows[0].posted_by).toBeTruthy();
+    expect(row.rows[0].posted_by_name).toBe('E2E Recruiter Own');
+  });
+
+  dbIt('GET /jobs?mine=1 returns only own postings (and 401 without auth)', async () => {
+    await postJob(recruiterToken, 'E2E Owned Role B');
+    const unauth = await request(app).get('/api/jobs?mine=1');
+    expect(unauth.status).toBe(401);
+
+    const mine = await request(app).get('/api/jobs?mine=1').set('Authorization', `Bearer ${recruiterToken}`);
+    expect(mine.status).toBe(200);
+    expect(mine.body.total).toBe(2);
+    expect(mine.body.jobs.every((j: any) => j.title.startsWith('E2E Owned'))).toBe(true);
+    // And the other recruiter sees none of them
+    const theirs = await request(app).get('/api/jobs?mine=1').set('Authorization', `Bearer ${otherToken}`);
+    expect(theirs.body.total).toBe(0);
+  });
+
+  dbIt('public board hides closed jobs by default, includes them with includeUnavailable=1; pagination envelope is correct', async () => {
+    const paged = await request(app).get('/api/jobs?page=1&limit=5&q=E2E');
+    expect(paged.status).toBe(200);
+    expect(paged.body).toHaveProperty('totalPages');
+    expect(paged.body.jobs.length).toBeLessThanOrEqual(5);
+    expect(paged.body.jobs.some((j: any) => j.id === ownedJobId)).toBe(true);
+
+    await request(app).patch(`/api/jobs/${ownedJobId}/status`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'closed' });
+    // Default board hides it
+    const after = await request(app).get('/api/jobs?q=E2E');
+    expect(after.body.jobs.some((j: any) => j.id === ownedJobId)).toBe(false);
+    // Student board (includeUnavailable) still sees it, with status for the badge
+    const incl = await request(app).get('/api/jobs?q=E2E&includeUnavailable=1');
+    const closedRow = incl.body.jobs.find((j: any) => j.id === ownedJobId);
+    expect(closedRow).toBeTruthy();
+    expect(closedRow.status).toBe('closed');
+    // Owner still sees it in their manage view
+    const mineAfter = await request(app).get('/api/jobs?mine=1').set('Authorization', `Bearer ${recruiterToken}`);
+    const closed = mineAfter.body.jobs.find((j: any) => j.id === ownedJobId);
+    expect(closed.status).toBe('closed');
+  });
+
+  dbIt('non-owner cannot edit/close/fill/delete a job (403)', async () => {
+    const target = jobIds[1]; // Owned Role B, still open
+    const patch = await request(app).patch(`/api/jobs/${target}`).set('Authorization', `Bearer ${otherToken}`).send({ title: 'Hacked' });
+    expect(patch.status).toBe(403);
+    const status = await request(app).patch(`/api/jobs/${target}/status`).set('Authorization', `Bearer ${otherToken}`).send({ status: 'filled' });
+    expect(status.status).toBe(403);
+    const del = await request(app).delete(`/api/jobs/${target}`).set('Authorization', `Bearer ${otherToken}`);
+    expect(del.status).toBe(403);
+  });
+
+  dbIt('owner can edit a job; DELETE is blocked with applicants (409) and allowed without', async () => {
+    const target = jobIds[1];
+    const edit = await request(app).patch(`/api/jobs/${target}`).set('Authorization', `Bearer ${recruiterToken}`).send({ openings: 9, description: 'Updated by owner' });
+    expect(edit.status).toBe(200);
+    expect(edit.body.job.openings).toBe(9);
+
+    // Applicant exists → 409, job preserved
+    await pool.query(
+      `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+       VALUES ($1, $2, 'E2E Owned Role B', 'E2E Corp', 'std-e2e-cand-x', 'E2E Candidate', CURRENT_DATE, 'Applied', 70)
+       ON CONFLICT (id) DO NOTHING`,
+      [`app-e2e-${Date.now()}`, target]
+    );
+    const delBlocked = await request(app).delete(`/api/jobs/${target}`).set('Authorization', `Bearer ${recruiterToken}`);
+    expect(delBlocked.status).toBe(409);
+    await pool.query(`DELETE FROM applications WHERE job_id = $1`, [target]);
+
+    // Fill → allowed; then delete (no applicants now) → 200
+    const fill = await request(app).patch(`/api/jobs/${target}/status`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'filled' });
+    expect(fill.status).toBe(200);
+    const del = await request(app).delete(`/api/jobs/${target}`).set('Authorization', `Bearer ${recruiterToken}`);
+    expect(del.status).toBe(200);
+  });
+
+  dbIt('GET /applications?mine=1 scopes candidates to the recruiter own jobs', async () => {
+    // Re-open role A and attach a candidate to it
+    await request(app).patch(`/api/jobs/${ownedJobId}/status`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'open' });
+    await pool.query(
+      `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+       VALUES ($1, $2, 'E2E Owned Role A', 'E2E Corp', 'std-e2e-cand-y', 'E2E Candidate Y', CURRENT_DATE, 'Applied', 84)
+       ON CONFLICT (id) DO NOTHING`,
+      [`app-e2e-mine-${Date.now()}`, ownedJobId]
+    );
+    const mine = await request(app).get('/api/applications?mine=1').set('Authorization', `Bearer ${recruiterToken}`);
+    expect(mine.status).toBe(200);
+    expect(mine.body.some((a: any) => a.jobId === ownedJobId)).toBe(true);
+    const other = await request(app).get('/api/applications?mine=1').set('Authorization', `Bearer ${otherToken}`);
+    expect(other.body.some((a: any) => a.jobId === ownedJobId)).toBe(false);
+  });
+
+  dbIt('bulk-status: owner shortlists candidates; non-owner and foreign jobs are untouched', async () => {
+    // Two candidates on owned role A, one on a foreign job
+    const c1 = `app-e2e-bs1-${Date.now()}`;
+    const c2 = `app-e2e-bs2-${Date.now()}`;
+    const cForeign = `app-e2e-bsf-${Date.now()}`;
+    const foreignJobId = `job-e2e-foreign-${Date.now()}`;
+    await pool.query(
+      `INSERT INTO jobs (id, title, company, location, type, stipend_or_salary, description, required_skills, eligible_branches, posted_by)
+       VALUES ($1, 'E2E Foreign Job', 'Elsewhere Corp', 'Mumbai', 'Internship', '₹10k', '', '[]'::jsonb, '[]'::jsonb, 'usr-someone-else')
+       ON CONFLICT (id) DO NOTHING`,
+      [foreignJobId]
+    );
+    jobIds.push(foreignJobId);
+    for (const [id, jobId] of [[c1, ownedJobId], [c2, ownedJobId], [cForeign, foreignJobId]] as const) {
+      await pool.query(
+        `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+         VALUES ($1, $2, 'E2E Role', 'E2E Corp', 'std-e2e-cand-z', 'E2E Candidate Z', CURRENT_DATE, 'Applied', 70)
+         ON CONFLICT (id) DO NOTHING`,
+        [id, jobId]
+      );
+    }
+
+    // Reject the foreign one first so it does not appear in later scoping asserts
+    await pool.query(`DELETE FROM applications WHERE id = $1`, [cForeign]);
+
+    const res = await request(app)
+      .patch('/api/applications/bulk-status')
+      .set('Authorization', `Bearer ${recruiterToken}`)
+      .send({ ids: [c1, c2], status: 'Shortlisted' });
+    expect(res.status).toBe(200);
+    expect(res.body.updated).toBe(2);
+
+    const rows = await pool.query(`SELECT id, status FROM applications WHERE id = ANY($1)`, [[c1, c2]]);
+    expect(rows.rows.every(r => r.status === 'Shortlisted')).toBe(true);
+
+    // Non-owner cannot move them
+    const forbidden = await request(app)
+      .patch('/api/applications/bulk-status')
+      .set('Authorization', `Bearer ${otherToken}`)
+      .send({ ids: [c1], status: 'Rejected' });
+    expect(forbidden.body.updated).toBe(0);
+
+    // Invalid status rejected
+    const bad = await request(app)
+      .patch('/api/applications/bulk-status')
+      .set('Authorization', `Bearer ${recruiterToken}`)
+      .send({ ids: [c1], status: 'Maybe' });
+    expect(bad.status).toBe(400);
+
+    await pool.query(`DELETE FROM applications WHERE id = ANY($1)`, [[c1, c2]]);
+  });
+
+  dbIt('closed jobs reject new applications with 409', async () => {
+    await request(app).patch(`/api/jobs/${ownedJobId}/status`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'closed' });
+    const res = await request(app).post('/api/applications').send({
+      jobId: ownedJobId, jobTitle: 'E2E Owned Role A', company: 'E2E Corp',
+      studentId: 'std-e2e-cand-z', studentName: 'E2E Candidate Z', aiMatchScore: 85,
+    });
+    expect(res.status).toBe(409);
+    expect(String(res.body.error)).toMatch(/no longer accepting/i);
+    await request(app).patch(`/api/jobs/${ownedJobId}/status`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'open' });
+  });
+});
+
+// ── JOB-ALERTS PREFERENCE TOGGLE ─────────────────────────────────────────────
+describe('Job-alerts preference (GET/PATCH /me/job-alerts)', () => {
+  let token = '';
+  let email = '';
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    email = `e2e-alerts-${Date.now()}@spark.test`;
+    const { hashPassword } = await import('./auth');
+    const hash = await hashPassword('Alerts!2026');
+    await pool.query(
+      `INSERT INTO users (id, name, email, role, password_hash)
+       VALUES ($1, 'E2E Alerts User', $2, 'student', $3)
+       ON CONFLICT (email) DO UPDATE SET password_hash = $3`,
+      [`usr-e2e-alerts-${Date.now()}`, email, hash]
+    );
+    const res = await request(app).post('/api/login').send({ email, password: 'Alerts!2026' });
+    token = res.body.token;
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    await pool.query(`DELETE FROM users WHERE email = $1`, [email]).catch(() => {});
+  });
+
+  dbIt('defaults to enabled and flips on demand (401 without auth)', async () => {
+    const unauth = await request(app).get('/api/me/job-alerts');
+    expect(unauth.status).toBe(401);
+
+    const initial = await request(app).get('/api/me/job-alerts').set('Authorization', `Bearer ${token}`);
+    expect(initial.status).toBe(200);
+    expect(initial.body.jobAlertsEnabled).toBe(true);
+
+    const off = await request(app).patch('/api/me/job-alerts').set('Authorization', `Bearer ${token}`).send({ enabled: false });
+    expect(off.status).toBe(200);
+    expect(off.body.jobAlertsEnabled).toBe(false);
+
+    const confirm = await request(app).get('/api/me/job-alerts').set('Authorization', `Bearer ${token}`);
+    expect(confirm.body.jobAlertsEnabled).toBe(false);
+
+    // Invalid payload
+    const bad = await request(app).patch('/api/me/job-alerts').set('Authorization', `Bearer ${token}`).send({ enabled: 'yes' });
+    expect(bad.status).toBe(400);
+
+    await request(app).patch('/api/me/job-alerts').set('Authorization', `Bearer ${token}`).send({ enabled: true });
+  });
+});

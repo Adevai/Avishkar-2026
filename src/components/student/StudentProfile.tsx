@@ -18,7 +18,8 @@ import {
   Edit3,
   FileCheck2,
   AlertCircle,
-  Camera
+  Camera,
+  Bell
 } from 'lucide-react';
 import { PersonalizeProfileModal } from './PersonalizeProfileModal';
 import { StudentIdCardVerificationModal } from './StudentIdCardVerificationModal';
@@ -38,6 +39,32 @@ export const StudentProfile: React.FC = () => {
   const [extractedResults, setExtractedResults] = useState<{ skill: string; confidence: number; category?: string }[]>([]);
   const [isPersonalizeModalOpen, setIsPersonalizeModalOpen] = useState(false);
   const [isIdModalOpen, setIsIdModalOpen] = useState(false);
+
+  // Job-alert digest preference (kept in sync with the email unsubscribe link)
+  const [jobAlertsEnabled, setJobAlertsEnabled] = useState<boolean | null>(null);
+  const [isSavingAlerts, setIsSavingAlerts] = useState(false);
+  React.useEffect(() => {
+    api.getJobAlertsPreference()
+      .then(p => setJobAlertsEnabled(p.jobAlertsEnabled))
+      .catch(() => setJobAlertsEnabled(null));
+  }, []);
+
+  const toggleJobAlerts = async () => {
+    if (jobAlertsEnabled === null || isSavingAlerts) return;
+    const next = !jobAlertsEnabled;
+    setIsSavingAlerts(true);
+    setJobAlertsEnabled(next); // optimistic
+    try {
+      const res = await api.setJobAlertsPreference(next);
+      setJobAlertsEnabled(res.jobAlertsEnabled);
+      setNotification(res.jobAlertsEnabled ? 'Daily job alerts enabled.' : 'Daily job alerts turned off.');
+    } catch (e: any) {
+      setJobAlertsEnabled(!next); // revert on failure
+      setNotification(e?.message || 'Could not update the preference.');
+    } finally {
+      setIsSavingAlerts(false);
+    }
+  };
   const [isPassportModalOpen, setIsPassportModalOpen] = useState(false);
   const [badges, setBadges] = useState<DigitalBadge[]>([]);
   const [fileDetails, setFileDetails] = useState<{ name: string; sizeKb: number } | null>(null);
@@ -48,6 +75,30 @@ export const StudentProfile: React.FC = () => {
       if (res && res.length > 0) setBadges(res);
     }).catch(() => {});
   }, [student.id]);
+
+  // Live coding telemetry — pulled from the real GitHub/LeetCode endpoints
+  // when the student has linked profile URLs. No hardcoded numbers.
+  const [ghTelemetry, setGhTelemetry] = useState<any>(null);
+  const [lcTelemetry, setLcTelemetry] = useState<any>(null);
+  const [telemetrySynced, setTelemetrySynced] = useState(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const ghUser = (student.githubUrl || '').match(/github\.com\/([^/?#]+)/i)?.[1];
+    const lcUser = (student.leetcodeUrl || '').match(/leetcode\.com\/(?:u\/)?([^/?#]+)/i)?.[1];
+    (async () => {
+      const [gh, lc] = await Promise.all([
+        ghUser ? api.getGithubTelemetry(ghUser).catch(() => null) : Promise.resolve(null),
+        lcUser ? api.getLeetcodeTelemetry(lcUser).catch(() => null) : Promise.resolve(null),
+      ]);
+      if (!cancelled) {
+        setGhTelemetry(gh);
+        setLcTelemetry(lc);
+        setTelemetrySynced(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [student.id, student.githubUrl, student.leetcodeUrl]);
 
   const handleCustomPhotoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -345,7 +396,7 @@ export const StudentProfile: React.FC = () => {
                 <h3 className="text-sm font-bold text-slate-800">Live Coding Telemetry</h3>
               </div>
               <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-50 text-purple-700 border border-purple-200">
-                Active Telemetry
+                {telemetrySynced ? 'Synced' : 'Syncing…'}
               </span>
             </div>
 
@@ -356,21 +407,41 @@ export const StudentProfile: React.FC = () => {
             <div className="grid grid-cols-2 gap-3">
               <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
                 <p className="text-[10px] font-bold text-slate-400 uppercase">GitHub Activity</p>
-                <p className="text-base font-extrabold text-slate-900 mt-1">18 Repos</p>
-                <p className="text-[11px] text-emerald-600 font-semibold">280+ Annual Commits</p>
+                {ghTelemetry ? (
+                  <>
+                    <p className="text-base font-extrabold text-slate-900 mt-1">{ghTelemetry.githubRepos} Repos</p>
+                    <p className="text-[11px] text-emerald-600 font-semibold">{ghTelemetry.githubCommits} Commits (est.)</p>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-slate-500 mt-2">
+                    {telemetrySynced ? 'No GitHub profile linked yet' : 'Fetching…'}
+                  </p>
+                )}
               </div>
               <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
                 <p className="text-[10px] font-bold text-slate-400 uppercase">LeetCode Solved</p>
-                <p className="text-base font-extrabold text-slate-900 mt-1">146 Problems</p>
-                <p className="text-[11px] text-amber-600 font-semibold">68 Med • 14 Hard</p>
+                {lcTelemetry ? (
+                  <>
+                    <p className="text-base font-extrabold text-slate-900 mt-1">{lcTelemetry.leetcodeSolved} Problems</p>
+                    <p className="text-[11px] text-amber-600 font-semibold">{lcTelemetry.leetcodeMedium} Med • {lcTelemetry.leetcodeHard} Hard</p>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-slate-500 mt-2">
+                    {telemetrySynced ? 'No LeetCode profile linked yet' : 'Fetching…'}
+                  </p>
+                )}
               </div>
             </div>
 
             <div className="p-2.5 rounded-xl bg-purple-50/70 border border-purple-200/60 flex items-center justify-between text-xs">
               <span className="font-semibold text-purple-900">Verified Coding Bonus:</span>
-              <span className="font-extrabold text-purple-700 bg-white px-2 py-0.5 rounded-lg border border-purple-200">
-                +14% Readiness Boost
-              </span>
+              {ghTelemetry?.telemetryScoreBonus || lcTelemetry?.telemetryScoreBonus ? (
+                <span className="font-extrabold text-purple-700 bg-white px-2 py-0.5 rounded-lg border border-purple-200">
+                  +{Math.max(ghTelemetry?.telemetryScoreBonus || 0, lcTelemetry?.telemetryScoreBonus || 0)}% Readiness Boost
+                </span>
+              ) : (
+                <span className="text-[11px] text-purple-700 font-semibold">Link your GitHub to earn a boost</span>
+              )}
             </div>
           </div>
 
@@ -569,16 +640,22 @@ export const StudentProfile: React.FC = () => {
 
               {/* ATS Resume Score & Optimizer Suggestions */}
               {student.resumeUploaded && (
-                <div className="mt-4 p-4 rounded-2xl bg-gradient-to-r from-blue-50/70 to-indigo-50/70 border border-blue-200/80 text-left space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Sparkles className="w-4 h-4 text-blue-600" />
-                      <h4 className="text-xs font-bold text-slate-900">ATS Resume Optimizer & Diagnostic Score</h4>
+                <div className="mt-4 p-4 rounded-2xl bg-gradient-to-r from-blue-50/70 to-indigo-50/70 border border-blue-200/80 text-left space-y-2.5">                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-blue-600" />
+                        <h4 className="text-xs font-bold text-slate-900">ATS Resume Optimizer & Diagnostic Score</h4>
+                      </div>
+                      <span className="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-extrabold text-xs">
+                        Profile Strength: {Math.min(99,
+                          45
+                          + (student.resumeUploaded ? 20 : 0)
+                          + (student.verifiedSkills.length > 0 ? 15 : 0)
+                          + (student.githubUrl ? 10 : 0)
+                          + (student.idCardVerified ? 5 : 0)
+                          + Math.min(4, Math.floor(student.declaredSkills.length / 3))
+                        )}/100
+                      </span>
                     </div>
-                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-extrabold text-xs">
-                      ATS Score: 88/100
-                    </span>
-                  </div>
 
                   <p className="text-[11px] text-slate-600">
                     High ATS parseability for target role ({student.targetRole}). Recommended optimizations to maximize interview conversion:
@@ -618,6 +695,36 @@ export const StudentProfile: React.FC = () => {
               <p className="text-xs text-slate-500 mt-1">
                 These competencies are benchmarked against corporate requirements during opportunity matching.
               </p>
+            </div>
+
+            {/* Daily job-alert digest preference */}
+            <div className="mt-3 p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  <Bell className="w-3.5 h-3.5 text-blue-600" />
+                  Daily Job Alert Emails
+                </p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Get an email when new postings match your verified skills above 80%.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={jobAlertsEnabled === true}
+                disabled={jobAlertsEnabled === null || isSavingAlerts}
+                onClick={toggleJobAlerts}
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                  jobAlertsEnabled ? 'bg-emerald-500' : 'bg-slate-300'
+                } ${jobAlertsEnabled === null ? 'opacity-50' : ''}`}
+                title={jobAlertsEnabled ? 'Click to turn off daily job alerts' : 'Click to turn on daily job alerts'}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    jobAlertsEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
             </div>
 
             {/* Skill Add Form */}

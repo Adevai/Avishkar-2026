@@ -63,6 +63,9 @@ export const Register: React.FC = () => {
   const [otpError, setOtpError] = useState('');
   const [otpSuccess, setOtpSuccess] = useState('');
 
+  // Step 3: server-side registration failure (surfaced to the user — never silently swallowed)
+  const [regError, setRegError] = useState('');
+
   // Step 3: Student Academic Intake
   const [college, setCollege] = useState('');
   const [degree, setDegree] = useState('B.Tech');
@@ -118,6 +121,12 @@ export const Register: React.FC = () => {
       desc: 'Regional policy, grants & youth readiness',
       icon: Landmark 
     },
+    {
+      id: 'alumni',
+      label: 'Alumni / Mentor',
+      desc: 'Mentor students & provide guidance',
+      icon: User
+    }
   ] as const;
 
   const targetRoles = [
@@ -162,7 +171,13 @@ export const Register: React.FC = () => {
     try {
       const res = await api.requestRegistrationOtp(targetEmail, targetName);
       setOtpSent(true);
-      setOtpSuccess(res.message || `Verification code sent to ${targetEmail}`);
+      // devOtp is only present in non-production responses (SMTP fallback) so
+      // local testing never requires digging through the database for the code.
+      setOtpSuccess(
+        res.devOtp
+          ? `${res.message || 'Verification code sent'} — dev OTP: ${res.devOtp}`
+          : (res.message || `Verification code sent to ${targetEmail}`)
+      );
     } catch (err: any) {
       setOtpError(err.message || 'Failed to dispatch verification code. Please try again.');
     } finally {
@@ -179,6 +194,7 @@ export const Register: React.FC = () => {
 
   const handleVerifyOtp = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isVerifyingOtp) return; // re-render race guard: drop duplicate submits
     if (!otpCode.trim() || otpCode.trim().length < 6) {
       setOtpError('Please enter a valid 6-digit OTP code.');
       return;
@@ -201,6 +217,7 @@ export const Register: React.FC = () => {
 
   const handleCompleteRegistration = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading) return; // re-render race guard: the first click always wins
     setIsLoading(true);
 
     try {
@@ -226,11 +243,12 @@ export const Register: React.FC = () => {
       localStorage.setItem('spark_new_registration', 'true');
       localStorage.removeItem('spark_intake_completed');
       navigate('/onboarding');
-    } catch (err) {
-      console.error(err);
-      localStorage.setItem('spark_new_registration', 'true');
-      localStorage.removeItem('spark_intake_completed');
-      navigate('/onboarding');
+    } catch (err: any) {
+      // The account was NOT persisted — show the real reason instead of
+      // navigating away and pretending the signup succeeded.
+      const msg = err?.message || 'Registration failed. Please try again.';
+      setRegError(msg);
+      console.error('Registration failed:', err);
     } finally {
       setIsLoading(false);
     }
@@ -542,7 +560,23 @@ export const Register: React.FC = () => {
       {/* STEP 3: Role-Specific Details */}
       {currentStep === 3 && (
         <form onSubmit={handleCompleteRegistration} className="space-y-4">
-          
+
+          {regError && (
+            <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 flex items-start gap-2.5 text-rose-700 text-xs font-semibold">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <span>{regError}</span>
+                <button
+                  type="button"
+                  onClick={() => setRegError('')}
+                  className="block mt-1 text-[11px] underline text-rose-600 hover:text-rose-800"
+                >
+                  Dismiss and try again
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* STUDENT FORM */}
           {accountType === 'student' && (
             <div className="space-y-3.5">

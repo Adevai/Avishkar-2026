@@ -39,6 +39,10 @@ interface AppContextType {
   verifyAndCompleteModule: (milestoneId: string, moduleId: string, score: number) => Promise<void>;
   jobs: JobOpportunity[];
   addJob: (job: Omit<JobOpportunity, 'id' | 'postedDate'>) => Promise<void>;
+  editJob: (jobId: string, patch: Partial<JobOpportunity>) => Promise<JobOpportunity>;
+  setJobStatus: (jobId: string, status: 'open' | 'closed' | 'filled') => Promise<JobOpportunity>;
+  deleteJob: (jobId: string) => Promise<void>;
+  loadMyCandidates: () => Promise<JobApplication[]>;
   applications: JobApplication[];
   applyForJob: (jobId: string, customJob?: JobOpportunity) => Promise<void>;
   withdrawApplication: (jobId: string) => Promise<void>;
@@ -70,6 +74,19 @@ interface AppContextType {
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
+
+// ── Auth session (JWT) helpers ────────────────────────────────────
+// The JWT written by /login (spark_jwt) is the source of truth for identity.
+function readSession(): { email: string | null; sub: string | null } {
+  try {
+    const token = localStorage.getItem('spark_jwt');
+    if (token) {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      return { email: payload?.email || null, sub: payload?.sub || null };
+    }
+  } catch (e) {}
+  return { email: null, sub: null };
+}
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentRole, setCurrentRoleState] = useState<UserRole>(() => {
@@ -105,7 +122,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   });
 
   const [isAssessmentActive, setIsAssessmentActive] = useState<boolean>(() => {
-    return localStorage.getItem('spark_assessment_locked') === 'true';
+    try {
+      const locked = localStorage.getItem('spark_assessment_locked') === 'true';
+      // A lock with no saved in-progress answers is stale (crash/reload) —
+      // never trap the user behind it.
+      const inProgress = !!localStorage.getItem('spark_active_assessment_v1');
+      if (locked && !inProgress) {
+        localStorage.removeItem('spark_assessment_locked');
+        return false;
+      }
+      return locked;
+    } catch (e) {
+      return false;
+    }
   });
 
   const setActiveTab = (tab: string) => {
@@ -115,17 +144,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     setActiveTabState(tab);
   };
+  // Real login session (if any) — kept fresh via the 'spark:session' event
+  // that api.setToken dispatches on login/logout.
+  const [session, setSession] = useState(readSession);
+  useEffect(() => {
+    const onSessionChange = () => setSession(readSession());
+    window.addEventListener('spark:session', onSessionChange);
+    return () => window.removeEventListener('spark:session', onSessionChange);
+  }, []);
+
   const [student, setStudent] = useState<StudentProfile>(() => {
     const saved = localStorage.getItem('avishkar_student');
+    let base: StudentProfile = INITIAL_STUDENT;
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed && parsed.id && parsed.name) {
-          return parsed;
-        }
+        if (parsed && parsed.id && parsed.name) base = parsed;
       } catch (e) {}
     }
-    return INITIAL_STUDENT;
+    // A real login session always wins over any cached demo persona.
+    if (session.email && base.email !== session.email) {
+      base = { ...base, email: session.email };
+    }
+    return base;
   });
 
   const [assessmentResult, setAssessmentResult] = useState<AssessmentResult | null>(() => {
@@ -206,13 +247,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setDbHealth(health);
 
         if (health && health.status === 'healthy') {
-          // Load jobs from PG
-          const pgJobs = await api.getJobs();
-          if (pgJobs && pgJobs.length > 0) setJobs(pgJobs);
+          // Load the student board from PG (paged envelope; include closed/filled
+          // rows so JobMatches can render a friendly 'no longer accepting' state)
+          const pgJobs = await api.getJobs({ limit: 200, includeUnavailable: true });
+          if (pgJobs && pgJobs.jobs && pgJobs.jobs.length > 0) setJobs(pgJobs.jobs);
 
-          // Load applications from PG
-          const pgApps = await api.getApplications();
-          if (pgApps && pgApps.length > 0) setApplications(pgApps);
+          // Load applications from PG — global feed only for logged-out
+          // browsing; logged-in users get a scoped fetch after identity sync.
+          if (!session.email) {
+            const pgApps = await api.getApplications();
+            if (pgApps && pgApps.length > 0) setApplications(pgApps);
+          }
 
           // Load MoUs from PG
           const pgMous = await api.getMoUs();
@@ -236,6 +281,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return () => clearTimeout(t);
     }
   }, [notification]);
+
+  // Identity sync: pull the real profile for the logged-in session.
+  // Runs on mount and whenever the JWT changes (login/logout).
+  useEffect(() => {
+    const sessionEmail = session.email;
+    if (!sessionEmail) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const me = await api.getStudentMe();
+        if (cancelled) return;
+        if (me && me.id) {
+          setStudent(me);
+          // Applications belong to the resolved student — scoped, not global.
+          try {
+            const apps = await api.getApplications(me.id);
+            setApplications(apps);
+          } catch (e) {}
+        } else {
+          // No student profile for this account (alumni / TPO / HR / gov logins) —
+          // still align identity so portals resolve by the session email.
+          setStudent(prev => (prev.email === sessionEmail ? prev : { ...prev, email: sessionEmail }));
+        }
+      } catch (e) {
+        /* keep cached persona when the backend is unreachable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session.email, session.sub]);
 
   // Persist state to local storage
   useEffect(() => {
@@ -375,6 +451,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     role: UserRole;
     name: string;
     email: string;
+    password?: string;
     college?: string;
     degree?: string;
     branch?: string;
@@ -390,6 +467,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }) => {
     try {
       const res = await api.registerUser(data);
+
+      // The account now exists server-side — establish a real JWT session
+      // immediately so dashboards, notifications & trackers are auth-scoped.
+      if (data.password) {
+        try {
+          await api.login(data.email, data.password);
+        } catch (loginErr) {
+          console.warn('Auto-login after registration failed (account was still created):', loginErr);
+        }
+      }
+
       if (data.role === 'student' && res.student) {
         setStudent(res.student);
         setAssessmentResult(null);
@@ -427,36 +515,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setCurrentRole(data.role);
       setNotification(`Welcome to S.P.A.R.K., ${data.name}! Your ${data.role} portal is initialized.`);
     } catch (err: any) {
-      console.warn('Backend register call failed, creating local session:', err);
-      if (data.role === 'student') {
-        const newStudent: StudentProfile = {
-          id: `std-${Date.now().toString().slice(-6)}`,
-          name: data.name,
-          email: data.email,
-          avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(data.name)}`,
-          college: data.college || 'Institute of Technology',
-          degree: data.degree || 'B.Tech',
-          branch: data.branch || 'Computer Science & Engineering',
-          semester: Number(data.semester) || 1,
-          cgpa: Number(data.cgpa) || 7.5,
-          graduationYear: Number(data.graduationYear) || 2026,
-          targetRole: data.targetRole || 'Full Stack Cloud Engineer',
-          bio: data.bio || `Undergraduate student at ${data.college || 'engineering institute'}.`,
-          resumeUploaded: false,
-          resumeName: '',
-          declaredSkills: [],
-          verifiedSkills: [],
-          assessmentCompleted: false,
-          readinessScore: 15,
-        };
-        setStudent(newStudent);
-        setAssessmentResult(null);
-        setApplications([]);
-        localStorage.removeItem('avishkar_assessment');
-        localStorage.removeItem('avishkar_apps');
-      }
-      setCurrentRole(data.role);
-      setNotification(`Welcome, ${data.name}! Portal active.`);
+      // Registration failed server-side — the account was NOT persisted.
+      // Propagate the error so the UI can show the real reason
+      // (no silent local-only fallback that fakes a successful signup).
+      const reason = err?.message || 'Registration failed. Please try again.';
+      console.error('Registration failed:', reason);
+      throw new Error(reason);
     }
   };
 
@@ -654,6 +718,38 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setNotification(`Application status updated to ${status}`);
   };
 
+  // ── Recruiter job lifecycle (owner-only server routes) ────────────────────
+  const editJob = async (jobId: string, patch: Partial<JobOpportunity>) => {
+    const updated = await api.updateJob(jobId, patch);
+    setJobs(prev => prev.map(j => (j.id === jobId ? { ...j, ...updated } : j)));
+    setNotification(`Posting "${updated.title}" updated.`);
+    return updated;
+  };
+
+  const setJobStatus = async (jobId: string, status: 'open' | 'closed' | 'filled') => {
+    const updated = await api.setJobStatus(jobId, status);
+    setJobs(prev => prev.map(j => (j.id === jobId ? { ...j, ...updated } : j)));
+    setNotification(
+      status === 'filled'
+        ? `"${updated.title}" marked as filled — applicants notified.`
+        : status === 'closed'
+        ? `"${updated.title}" closed — applicants notified.`
+        : `"${updated.title}" is live again.`
+    );
+    return updated;
+  };
+
+  const deleteJob = async (jobId: string) => {
+    await api.deleteJob(jobId);
+    setJobs(prev => prev.filter(j => j.id !== jobId));
+    setNotification('Posting deleted.');
+  };
+
+  const loadMyCandidates = async (): Promise<JobApplication[]> => {
+    const apps = await api.getMyJobApplications();
+    return apps;
+  };
+
   const addMoU = async (newMoU: Omit<MoU, 'id' | 'signedDate' | 'status'> & { digitalSignatureHash?: string }) => {
     const mou: MoU = {
       ...newMoU,
@@ -706,6 +802,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         verifyAndCompleteModule,
         jobs,
         addJob,
+        editJob,
+        setJobStatus,
+        deleteJob,
+        loadMyCandidates,
         applications,
         applyForJob,
         withdrawApplication,

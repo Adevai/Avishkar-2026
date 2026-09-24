@@ -78,7 +78,7 @@ export const AIAssessment: React.FC = () => {
       if (!isFinished && document.hidden) {
         setTabViolations(prev => {
           const next = prev + 1;
-          setProctoringAlert(`⚠️ Proctoring Alert: Tab switch detected! (Violation ${next}/3). Maintain focus on the assessment window.`);
+          setProctoringAlert(`⚠️ Proctoring Alert: Tab switch detected! (Violation ${next}/1). Maintain focus on the assessment window.`);
           return next;
         });
       }
@@ -88,7 +88,7 @@ export const AIAssessment: React.FC = () => {
       if (!isFinished) {
         setTabViolations(prev => {
           const next = prev + 1;
-          setProctoringAlert(`⚠️ Focus Lost: Window switched (Violation ${next}/3). AI proctoring logs external window switches.`);
+          setProctoringAlert(`⚠️ Focus Lost: Window switched (Violation ${next}/1). AI proctoring logs external window switches.`);
           return next;
         });
       }
@@ -205,8 +205,8 @@ export const AIAssessment: React.FC = () => {
   };
 
     useEffect(() => {
-    if (tabViolations >= 3 && !isFinished) {
-      setNotification('Assessment terminated due to anti-cheat violation (3/3 tab switches).');
+    if (tabViolations >= 1 && !isFinished) {
+      setNotification('Assessment terminated due to anti-cheat violation (1/1 tab switches).');
       handleCompleteQuiz();
     }
   }, [tabViolations, isFinished]);
@@ -254,7 +254,7 @@ export const AIAssessment: React.FC = () => {
             </li>
             <li className="flex items-start gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-blue-500 mt-1.5 shrink-0" />
-              3 violations will result in automatic termination of the assessment.
+              A single violation (switching tabs) will result in automatic termination of the assessment.
             </li>
           </ul>
         </div>
@@ -284,7 +284,7 @@ export const AIAssessment: React.FC = () => {
                 <span className="font-bold text-slate-900 mr-1.5">AI Anti-Cheat Proctoring Telemetry Active:</span>
                 <span className="text-slate-700">Tab-switch detection enabled. </span>
                 <span className={`font-bold ml-1 ${tabViolations > 0 ? 'text-rose-600' : 'text-emerald-700'}`}>
-                  (Violations: {tabViolations}/3)
+                  (Violations: {tabViolations}/1)
                 </span>
               </div>
             </div>

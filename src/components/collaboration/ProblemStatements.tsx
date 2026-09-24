@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { formatDisplayDate } from '../../utils/formatDate';
 import { 
   Lightbulb, 
   PlusCircle, 
@@ -31,13 +32,14 @@ export const ProblemStatements: React.FC = () => {
     if (!title.trim() || !description.trim()) return;
 
     const tags = tagsInput.split(',').map(t => t.trim());
+    const deadline = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
     addProblem({
       title,
       company,
       domain,
       description,
       rewardOrGrant,
-      deadline: '2024-12-31',
+      deadline,
       tags,
     });
 
@@ -135,7 +137,7 @@ export const ProblemStatements: React.FC = () => {
             <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
               <span className="text-[11px] text-slate-400 flex items-center gap-1">
                 <Calendar className="w-3 h-3" />
-                <span>Deadline: {prob.deadline}</span>
+                <span>Deadline: {formatDisplayDate(prob.deadline)}</span>
               </span>
 
               {currentRole === 'student' ? (

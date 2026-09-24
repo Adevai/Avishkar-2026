@@ -209,7 +209,7 @@ export async function generateLargeSeed(): Promise<void> {
           title, company, null,
           rand() > 0.7 ? `${city} / Remote` : city,
           isIntern ? 'Internship' : 'Full-Time',
-          isIntern ? `₹${randInt(25, 90) * 1000} / month` : `₹${randInt(6, 26)}.0 - ${randInt(12, 34)}.0 LPA`,
+          isIntern ? `₹${randInt(25, 90) * 1000} / month` : `₹${(() => { const lo = randInt(6, 26), hi = randInt(12, 34); return lo <= hi ? `${lo}.0 - ${hi}.0` : `${hi}.0 - ${lo}.0`; })()} LPA`,
           isIntern ? `${randInt(3, 6)} Months` : null,
           randInt(2, 45),
           `2026-0${randInt(1, 9)}-${String(randInt(10, 28)).padStart(2, '0')}`,

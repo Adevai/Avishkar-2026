@@ -218,13 +218,14 @@ export async function searchInstitutionsApi(query: string): Promise<VerifiedInst
   // 2. Fetch live data from open APIs in parallel with graceful timeout
   const apiPromises: Promise<void>[] = [];
 
-  // API 1: Hipolabs Indian Universities
+  // API 1: Hipolabs Indian Universities — proxied via the backend to avoid
+  // browser CORS blocks (the upstream API sends no Access-Control-Allow-Origin).
   const hipolabsPromise = (async () => {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3500);
       const res = await fetch(
-        `http://universities.hipolabs.com/search?country=India&name=${encodeURIComponent(query.trim())}`,
+        `/api/institutions/external?source=hipolabs&name=${encodeURIComponent(query.trim())}`,
         { signal: controller.signal }
       );
       clearTimeout(timeoutId);
@@ -256,9 +257,9 @@ export async function searchInstitutionsApi(query: string): Promise<VerifiedInst
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3500);
-      // Query Maharashtra by default or broad query
+      // Query Maharashtra by default or broad query — proxied via backend (CORS)
       const res = await fetch(
-        `https://indian-colleges-list.vercel.app/api/institutions/search?state=Maharashtra&q=${encodeURIComponent(query.trim())}`,
+        `/api/institutions/external?source=aicte&q=${encodeURIComponent(query.trim())}`,
         { signal: controller.signal }
       );
       clearTimeout(timeoutId);

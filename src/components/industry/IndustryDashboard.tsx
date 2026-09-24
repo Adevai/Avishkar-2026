@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
+import { api } from '../../services/api';
 import { 
   Building2, 
   Users, 
@@ -11,16 +12,125 @@ import {
   Eye, 
   Send,
   MapPin,
-  X
+  X,
+  Pencil,
+  Archive,
+  Trash2,
+  Search
 } from 'lucide-react';
-import { JobType } from '../../types';
+import { JobType, JobOpportunity } from '../../types';
+import { formatDisplayDate } from '../../utils/formatDate';
 
 export const IndustryDashboard: React.FC = () => {
-  const { jobs, addJob, applications, updateApplicationStatus, activeTab, setActiveTab, setNotification } = useApp();
+  const { jobs, addJob, editJob, setJobStatus, deleteJob, loadMyCandidates, applications, updateApplicationStatus, activeTab, setActiveTab, setNotification } = useApp();
   const [showPostModal, setShowPostModal] = useState(false);
+
+  // Recruiter-owned postings + their candidates (scoped by JWT server-side)
+  const [myJobs, setMyJobs] = useState<JobOpportunity[]>([]);
+  const [myApps, setMyApps] = useState<{ id: string; jobId: string; jobTitle: string; company: string; studentId: string; studentName: string; appliedDate: string; status: string; aiMatchScore: number }[]>([]);
+  const [loadingMine, setLoadingMine] = useState(true);
+  const [editingJobId, setEditingJobId] = useState<string | null>(null);
+  const [postingSearch, setPostingSearch] = useState('');
+
+  // Per-job candidate pipeline (bulk actions)
+  const [pipelineJobId, setPipelineJobId] = useState<string | null>(null);
+  const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
+  const [isBulkWorking, setIsBulkWorking] = useState(false);
+
+  const loadMine = async () => {
+    setLoadingMine(true);
+    try {
+      const [mineRes, mineApps] = await Promise.all([
+        api.getJobs({ mine: true, limit: 100 }),
+        api.getMyJobApplications(),
+      ]);
+      setMyJobs(mineRes.jobs || []);
+      setMyApps(mineApps as any);
+    } catch (e: any) {
+      console.warn('Failed to load recruiter postings:', e?.message);
+    } finally {
+      setLoadingMine(false);
+    }
+  };
+
+  useEffect(() => { loadMine(); }, []);
+
+  const filteredMyJobs = myJobs.filter(j => {
+    if (!postingSearch.trim()) return true;
+    const q = postingSearch.toLowerCase();
+    return j.title.toLowerCase().includes(q) || j.company.toLowerCase().includes(q) || j.location.toLowerCase().includes(q);
+  });
+
+  const startEdit = (job: JobOpportunity) => {
+    setEditingJobId(job.id);
+    setTitle(job.title);
+    setType(job.type);
+    setLocation(job.location);
+    setStipendOrSalary(job.stipendOrSalary);
+    setOpenings(String(job.openings));
+    setDescription(job.description || '');
+    setMinCgpa(String(job.minCgpa));
+    setSkillsInput(job.requiredSkills.map(rs => rs.name).join(', '));
+    setCompany(job.company);
+    setDeadline(job.deadline || '');
+    setActiveTab('post-job');
+  };
+
+  const resetForm = () => {
+    setEditingJobId(null);
+    setTitle('');
+    setDescription('');
+    setCompany('');
+    setDeadline('');
+  };
+
+  const handleLifecycle = async (jobId: string, action: 'open' | 'closed' | 'filled' | 'delete') => {
+    try {
+      if (action === 'delete') {
+        if (!window.confirm('Delete this posting permanently? Only possible when it has no applicants.')) return;
+        await deleteJob(jobId);
+      } else {
+        await setJobStatus(jobId, action);
+      }
+      await loadMine();
+    } catch (e: any) {
+      setNotification(e?.message || 'Action failed.');
+    }
+  };
+
+  const openPipeline = (jobId: string) => {
+    setPipelineJobId(prev => (prev === jobId ? null : jobId));
+    setSelectedCandidateIds(new Set());
+  };
+
+  const toggleCandidate = (appId: string) => {
+    setSelectedCandidateIds(prev => {
+      const next = new Set(prev);
+      if (next.has(appId)) next.delete(appId);
+      else next.add(appId);
+      return next;
+    });
+  };
+
+  const runBulk = async (status: string) => {
+    if (selectedCandidateIds.size === 0 || isBulkWorking) return;
+    setIsBulkWorking(true);
+    try {
+      const res = await api.bulkUpdateApplicationStatus({ ids: Array.from(selectedCandidateIds), status });
+      setNotification(`${res.updated} candidate(s) moved to "${status}" — students notified.`);
+      setSelectedCandidateIds(new Set());
+      await loadMine();
+    } catch (e: any) {
+      setNotification(e?.message || 'Bulk action failed.');
+    } finally {
+      setIsBulkWorking(false);
+    }
+  };
 
   // New Job Form State
   const [title, setTitle] = useState('');
+  const [company, setCompany] = useState('');
+  const [deadline, setDeadline] = useState('');
   const [type, setType] = useState<JobType>('Internship');
   const [location, setLocation] = useState('Pune / Bengaluru (Hybrid)');
   const [stipendOrSalary, setStipendOrSalary] = useState('₹45,000 / month');
@@ -29,7 +139,7 @@ export const IndustryDashboard: React.FC = () => {
   const [minCgpa, setMinCgpa] = useState('7.5');
   const [skillsInput, setSkillsInput] = useState('React.js, Node.js, Docker, REST APIs');
 
-  const handlePostSubmit = (e: React.FormEvent) => {
+  const handlePostSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
 
@@ -39,26 +149,33 @@ export const IndustryDashboard: React.FC = () => {
       minScore: 70
     }));
 
-    addJob({
-      title,
-      company: 'Tata Motors R&D',
-      companyLogo: 'https://images.unsplash.com/photo-1542744094-3a31f272c490?auto=format&fit=crop&q=80&w=120',
+    const payload = {
+      title: title.trim(),
+      company: company.trim() || 'My Company',
+      companyLogo: undefined as string | undefined,
       location,
       type,
       stipendOrSalary,
       openings: parseInt(openings) || 5,
-      deadline: '2024-11-15',
-      description: description || 'Exciting engineering role working on next-generation automotive embedded systems and connected cloud architectures.',
+      deadline: deadline || 'Rolling',
+      description: description || 'Exciting engineering role — apply with your verified S.P.A.R.K. profile.',
       requiredSkills: skillsArray,
       minCgpa: parseFloat(minCgpa) || 7.0,
       eligibleBranches: ['Computer Science & Engineering', 'AI & Data Science', 'Electronics & Telecommunication'],
-    });
+    };
 
-    setNotification(`Successfully posted vacancy: "${title}"`);
-    setShowPostModal(false);
-    setTitle('');
-    setDescription('');
-    setActiveTab('dashboard');
+    try {
+      if (editingJobId) {
+        await editJob(editingJobId, payload);
+      } else {
+        await addJob(payload);
+      }
+      resetForm();
+      setActiveTab('dashboard');
+      await loadMine();
+    } catch (err: any) {
+      setNotification(err?.message || 'Failed to save posting.');
+    }
   };
 
   return (
@@ -134,12 +251,12 @@ export const IndustryDashboard: React.FC = () => {
                 <PlusCircle className="w-6 h-6" />
               </div>
               <div>
-                <h2 className="text-lg font-bold text-slate-900">Post Campus Internship / Job Vacancy</h2>
-                <p className="text-xs text-slate-500 font-medium">Create an AI-benchmarked opening for verified university talent</p>
+                <h2 className="text-lg font-bold text-slate-900">{editingJobId ? 'Edit Vacancy' : 'Post Campus Internship / Job Vacancy'}</h2>
+                <p className="text-xs text-slate-500 font-medium">{editingJobId ? 'Update the live criteria — changes are visible to students instantly' : 'Create an AI-benchmarked opening for verified university talent'}</p>
               </div>
             </div>
             <button
-              onClick={() => setActiveTab('dashboard')}
+              onClick={() => { resetForm(); setActiveTab('dashboard'); }}
               className="text-xs font-bold text-slate-500 hover:text-slate-800 px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors"
             >
               ← Back to ATS Hub
@@ -147,16 +264,30 @@ export const IndustryDashboard: React.FC = () => {
           </div>
 
           <form onSubmit={handlePostSubmit} className="space-y-4 text-xs">
-            <div>
-              <label className="block font-bold text-slate-700 mb-1">Job / Internship Title</label>
-              <input
-                type="text"
-                placeholder="e.g. Edge AI Firmware Engineer, Cloud Backend Intern, Full Stack Developer..."
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
-                required
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Job / Internship Title</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Edge AI Firmware Engineer, Cloud Backend Intern, Full Stack Developer..."
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">Company Name</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Tata Motors R&D"
+                  value={company}
+                  onChange={(e) => setCompany(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                  required
+                />
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -232,6 +363,17 @@ export const IndustryDashboard: React.FC = () => {
             </div>
 
             <div>
+              <label className="block font-bold text-slate-700 mb-1">Application Deadline</label>
+              <input
+                type="text"
+                placeholder="e.g. 2026-11-15 or Rolling"
+                value={deadline}
+                onChange={(e) => setDeadline(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+              />
+            </div>
+
+            <div>
               <label className="block font-bold text-slate-700 mb-1">Role Description & Responsibilities</label>
               <textarea
                 rows={4}
@@ -254,7 +396,7 @@ export const IndustryDashboard: React.FC = () => {
                 type="submit"
                 className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold shadow-md transition-all hover:scale-105"
               >
-                Publish Campus Vacancy
+                {editingJobId ? 'Save Changes' : 'Publish Campus Vacancy'}
               </button>
             </div>
           </form>
@@ -262,32 +404,34 @@ export const IndustryDashboard: React.FC = () => {
       ) : (
         /* CONDITIONAL VIEW: RECRUITMENT HUB & ATS */
         <>
-          {/* Corporate Hiring Funnel KPIs */}
+          {/* Corporate Hiring Funnel KPIs — recruiter-scoped */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
-              <p className="text-xs text-slate-500 font-medium">Active Postings</p>
-              <p className="text-2xl font-extrabold text-slate-900 mt-1">{jobs.length}</p>
-              <p className="text-[11px] text-blue-600 font-semibold mt-0.5">Campus & Off-Campus</p>
+              <p className="text-xs text-slate-500 font-medium">My Active Postings</p>
+              <p className="text-2xl font-extrabold text-slate-900 mt-1">{myJobs.filter(j => (j.status || 'open') === 'open').length}</p>
+              <p className="text-[11px] text-blue-600 font-semibold mt-0.5">{myJobs.length} total incl. closed/filled</p>
             </div>
 
             <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
-              <p className="text-xs text-slate-500 font-medium">Total Applicants</p>
-              <p className="text-2xl font-extrabold text-indigo-700 mt-1">{applications.length + 142}</p>
-              <p className="text-[11px] text-emerald-600 font-semibold mt-0.5">From 18 Partner Colleges</p>
+              <p className="text-xs text-slate-500 font-medium">My Candidates</p>
+              <p className="text-2xl font-extrabold text-indigo-700 mt-1">{myApps.length}</p>
+              <p className="text-[11px] text-emerald-600 font-semibold mt-0.5">Applications to my postings</p>
             </div>
 
             <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
-              <p className="text-xs text-slate-500 font-medium">AI Shortlisted (Passed Cutoff)</p>
+              <p className="text-xs text-slate-500 font-medium">In Interview/Offer Stage</p>
               <p className="text-2xl font-extrabold text-emerald-600 mt-1">
-                {applications.filter(a => a.status === 'Shortlisted' || a.status === 'Interview Scheduled' || a.status === 'Offer Extended').length + 38}
+                {myApps.filter(a => a.status === 'Shortlisted' || a.status === 'Interview Scheduled' || a.status === 'Offer Extended').length}
               </p>
-              <p className="text-[11px] text-slate-400 mt-0.5">Matched &gt; 80% competency</p>
+              <p className="text-[11px] text-slate-400 mt-0.5">Advancing through my pipeline</p>
             </div>
 
             <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
-              <p className="text-xs text-slate-500 font-medium">Average Time-to-Hire</p>
-              <p className="text-2xl font-extrabold text-amber-600 mt-1">4.2 Days</p>
-              <p className="text-[11px] text-emerald-600 font-semibold mt-0.5">-60% vs traditional job boards</p>
+              <p className="text-xs text-slate-500 font-medium">Avg AI Match</p>
+              <p className="text-2xl font-extrabold text-amber-600 mt-1">
+                {myApps.length > 0 ? Math.round(myApps.reduce((sum, a) => sum + (a.aiMatchScore || 0), 0) / myApps.length) + '%' : '—'}
+              </p>
+              <p className="text-[11px] text-emerald-600 font-semibold mt-0.5">Quality of my applicant pool</p>
             </div>
           </div>
 
@@ -295,10 +439,10 @@ export const IndustryDashboard: React.FC = () => {
           <div className="bg-white rounded-2xl p-6 border border-slate-200/80 shadow-xs space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div>
-                <h2 className="text-sm font-bold text-slate-900">Recent Candidate Applications (ATS Pipeline)</h2>
-                <p className="text-xs text-slate-500">Live applications scored by AI Skill Mapping</p>
+                <h2 className="text-sm font-bold text-slate-900">Candidates for My Postings (ATS Pipeline)</h2>
+                <p className="text-xs text-slate-500">Live applications scored by AI Skill Mapping — scoped to jobs you posted</p>
               </div>
-              <span className="text-xs font-semibold text-slate-500">{applications.length} direct applications</span>
+              <span className="text-xs font-semibold text-slate-500">{myApps.length} direct applications</span>
             </div>
 
             <div className="overflow-x-auto">
@@ -314,7 +458,13 @@ export const IndustryDashboard: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {applications.map((app) => (
+                  {loadingMine ? (
+                    <tr><td colSpan={6} className="py-8 text-center text-slate-400">Loading your candidates…</td></tr>
+                  ) : myApps.length === 0 ? (
+                    <tr><td colSpan={6} className="py-8 text-center text-slate-400">
+                      No applications yet. Post a vacancy and candidates will appear here.
+                    </td></tr>
+                  ) : myApps.map((app) => (
                     <tr key={app.id} className="hover:bg-slate-50/80 transition-colors">
                       <td className="py-3.5 px-3">
                         <div className="font-bold text-slate-900">{app.studentName}</div>
@@ -336,7 +486,7 @@ export const IndustryDashboard: React.FC = () => {
                           <span>{app.aiMatchScore || 85}% Compatible</span>
                         </span>
                       </td>
-                      <td className="py-3.5 px-3 text-slate-500">{app.appliedDate}</td>
+                      <td className="py-3.5 px-3 text-slate-500">{formatDisplayDate(app.appliedDate)}</td>
                       <td className="py-3.5 px-3">
                         <span className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase ${
                           app.status === 'Offer Extended'
@@ -391,15 +541,128 @@ export const IndustryDashboard: React.FC = () => {
             </div>
           </div>
 
-          {/* Active Job Postings Matrix */}
+          {/* Per-job candidate pipeline with bulk actions */}
+          {pipelineJobId && (() => {
+            const pipelineJob = myJobs.find(j => j.id === pipelineJobId);
+            const pipelineApps = myApps.filter(a => a.jobId === pipelineJobId);
+            const allSelected = pipelineApps.length > 0 && pipelineApps.every(a => selectedCandidateIds.has(a.id));
+            return (
+              <div className="bg-white rounded-2xl p-6 border-2 border-indigo-200 shadow-xs space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                  <div>
+                    <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <Users className="w-4 h-4 text-indigo-600" />
+                      Candidate Pipeline — {pipelineJob?.title || 'Job'}
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">{pipelineApps.length} applicant(s) • select rows for bulk actions</p>
+                  </div>
+                  <button
+                    onClick={() => { setPipelineJobId(null); setSelectedCandidateIds(new Set()); }}
+                    className="text-xs font-bold text-slate-500 hover:text-slate-800 px-3 py-1.5 rounded-xl hover:bg-slate-100"
+                  >
+                    ✕ Close
+                  </button>
+                </div>
+
+                <div className={`flex flex-wrap items-center gap-2 p-3 rounded-xl ${
+                  selectedCandidateIds.size > 0 ? 'bg-indigo-50 border border-indigo-200' : 'bg-slate-50 border border-slate-200'
+                }`}>
+                  <label className="flex items-center gap-1.5 text-[11px] font-bold text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      onChange={(e) => setSelectedCandidateIds(e.target.checked ? new Set(pipelineApps.map(a => a.id)) : new Set())}
+                      className="w-3.5 h-3.5 rounded accent-indigo-600"
+                    />
+                    Select all
+                  </label>
+                  <span className="text-[11px] text-slate-400">|</span>
+                  <span className="text-[11px] font-bold text-indigo-700">{selectedCandidateIds.size} selected</span>
+                  <div className="flex-1" />
+                  <button
+                    onClick={() => runBulk('Shortlisted')}
+                    disabled={selectedCandidateIds.size === 0 || isBulkWorking}
+                    className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg font-bold text-[11px]"
+                  >
+                    Shortlist
+                  </button>
+                  <button
+                    onClick={() => runBulk('Interview Scheduled')}
+                    disabled={selectedCandidateIds.size === 0 || isBulkWorking}
+                    className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 text-white rounded-lg font-bold text-[11px]"
+                  >
+                    Schedule Interviews
+                  </button>
+                  <button
+                    onClick={() => runBulk('Rejected')}
+                    disabled={selectedCandidateIds.size === 0 || isBulkWorking}
+                    className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white rounded-lg font-bold text-[11px]"
+                  >
+                    Reject
+                  </button>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider">
+                        <th className="py-2.5 px-3 w-8"></th>
+                        <th className="py-2.5 px-3">Candidate</th>
+                        <th className="py-2.5 px-3 text-center">AI Match</th>
+                        <th className="py-2.5 px-3">Applied</th>
+                        <th className="py-2.5 px-3">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {pipelineApps.length === 0 ? (
+                        <tr><td colSpan={5} className="py-6 text-center text-slate-400">No applicants for this job yet.</td></tr>
+                      ) : pipelineApps.map(app => (
+                        <tr key={app.id} className={`hover:bg-slate-50/80 transition-colors ${selectedCandidateIds.has(app.id) ? 'bg-indigo-50/50' : ''}`}>
+                          <td className="py-3 px-3">
+                            <input
+                              type="checkbox"
+                              checked={selectedCandidateIds.has(app.id)}
+                              onChange={() => toggleCandidate(app.id)}
+                              className="w-3.5 h-3.5 rounded accent-indigo-600"
+                            />
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-bold text-slate-900">{app.studentName}</div>
+                            <div className="text-[11px] text-slate-400">ID: {app.studentId}</div>
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <span className={`inline-flex px-2 py-0.5 rounded-full font-extrabold text-[11px] ${
+                              app.aiMatchScore >= 90
+                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                : app.aiMatchScore >= 80
+                                ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                                : 'bg-amber-50 text-amber-700 border border-amber-200'
+                            }`}>
+                              {app.aiMatchScore}%
+                            </span>
+                          </td>
+                          <td className="py-3 px-3 text-slate-500">{formatDisplayDate(app.appliedDate)}</td>
+                          <td className="py-3 px-3">
+                            <span className="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase bg-slate-100 text-slate-700">{app.status}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Active Job Postings Matrix — recruiter-owned only, with lifecycle actions */}
           <div className="bg-white rounded-2xl p-6 border border-slate-200/80 shadow-xs space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <div>
-                <h2 className="text-sm font-bold text-slate-900">Your Active Job & Internship Postings</h2>
-                <p className="text-xs text-slate-500">Managing real-time criteria and college targeting</p>
+                <h2 className="text-sm font-bold text-slate-900">My Job & Internship Postings</h2>
+                <p className="text-xs text-slate-500">Edit criteria, close, or mark positions filled — applicants are notified automatically</p>
               </div>
               <button
-                onClick={() => setActiveTab('post-job')}
+                onClick={() => { resetForm(); setActiveTab('post-job'); }}
                 className="text-xs font-bold text-blue-600 hover:text-blue-800 flex items-center gap-1"
               >
                 <PlusCircle className="w-3.5 h-3.5" />
@@ -407,14 +670,40 @@ export const IndustryDashboard: React.FC = () => {
               </button>
             </div>
 
+            <div className="relative">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search my postings by title, company, or location…"
+                value={postingSearch}
+                onChange={(e) => setPostingSearch(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 rounded-xl border border-slate-200 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs"
+              />
+            </div>
+
+            {loadingMine ? (
+              <p className="text-xs text-slate-400 py-6 text-center">Loading your postings…</p>
+            ) : filteredMyJobs.length === 0 ? (
+              <p className="text-xs text-slate-400 py-6 text-center">
+                {myJobs.length === 0
+                  ? 'You have not posted any vacancies yet. Create your first posting to start receiving AI-matched candidates.'
+                  : 'No postings match your search.'}
+              </p>
+            ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {jobs.map((job) => (
+              {filteredMyJobs.map((job) => (
                 <div key={job.id} className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 flex flex-col justify-between">
                   <div>
                     <div className="flex items-start justify-between gap-2">
                       <h3 className="text-xs font-bold text-slate-900">{job.title}</h3>
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
-                        {job.type}
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                        (job.status || 'open') === 'open'
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : (job.status || 'open') === 'filled'
+                          ? 'bg-blue-100 text-blue-800'
+                          : 'bg-slate-200 text-slate-600'
+                      }`}>
+                        {(job.status || 'open') === 'open' ? 'Open' : (job.status || 'open') === 'filled' ? 'Filled' : 'Closed'}
                       </span>
                     </div>
                     <p className="text-[11px] text-slate-500 mt-1">{job.company} • {job.location}</p>
@@ -429,13 +718,76 @@ export const IndustryDashboard: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="mt-3 pt-2 border-t border-slate-200/60 flex items-center justify-between text-[10px] text-slate-400">
-                    <span>Openings: <strong>{job.openings}</strong></span>
-                    <span>Deadline: {job.deadline}</span>
+                  <div className="mt-3 pt-2 border-t border-slate-200/60">
+                    <div className="flex items-center justify-between text-[10px] text-slate-400">
+                      <span>Openings: <strong>{job.openings}</strong></span>
+                      <span>Deadline: {job.deadline || '—'}</span>
+                    </div>
+                    <div className="mt-2 flex items-center gap-1.5">
+                      <button
+                        onClick={() => openPipeline(job.id)}
+                        className={`flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold text-[11px] ${
+                          pipelineJobId === job.id
+                            ? 'bg-indigo-700 text-white'
+                            : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200'
+                        }`}
+                        title="Open candidate pipeline for this job"
+                      >
+                        <Users className="w-3 h-3" />
+                        <span>Candidates ({myApps.filter(a => a.jobId === job.id).length})</span>
+                      </button>
+                      <button
+                        onClick={() => startEdit(job)}
+                        className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold text-[11px]"
+                        title="Edit posting"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit</span>
+                      </button>
+                      {(job.status || 'open') === 'open' ? (
+                        <>
+                          <button
+                            onClick={() => handleLifecycle(job.id, 'closed')}
+                            className="flex items-center gap-1 px-2.5 py-1 bg-slate-600 hover:bg-slate-700 text-white rounded-lg font-semibold text-[11px]"
+                            title="Stop accepting applications"
+                          >
+                            <Archive className="w-3 h-3" />
+                            <span>Close</span>
+                          </button>
+                          <button
+                            onClick={() => handleLifecycle(job.id, 'filled')}
+                            className="flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-semibold text-[11px]"
+                            title="Mark position as filled"
+                          >
+                            <CheckCircle2 className="w-3 h-3" />
+                            <span>Filled</span>
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => handleLifecycle(job.id, 'open')}
+                          className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-[11px]"
+                          title="Reopen for applications"
+                        >
+                          <Eye className="w-3 h-3" />
+                          <span>Reopen</span>
+                        </button>
+                      )}
+                      {(job.status || 'open') !== 'open' && (
+                        <button
+                          onClick={() => handleLifecycle(job.id, 'delete')}
+                          className="flex items-center gap-1 px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-semibold text-[11px]"
+                          title="Delete permanently (no applicants allowed)"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}
             </div>
+            )}
           </div>
         </>
       )}

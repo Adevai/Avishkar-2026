@@ -253,6 +253,11 @@ export interface JobOpportunity {
   sourcePlatform?: 'LinkedIn' | 'Internshala' | 'Unstop' | 'Campus Direct' | 'Adzuna' | 'Google Jobs';
   /** ISO timestamp of the last successful sync from a live source */
   fetchedAt?: string;
+  /** Recruiter ownership (null for externally-synced listings) */
+  postedBy?: string;
+  postedByName?: string;
+  /** Lifecycle state — public board only shows 'open' */
+  status?: 'open' | 'closed' | 'filled';
   workplaceType?: 'On-site' | 'Hybrid' | 'Remote';
   experienceLevel?: 'Internship' | 'Entry Level (0-2 yrs)' | 'Associate';
   salaryBenchmark?: {

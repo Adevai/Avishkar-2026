@@ -157,18 +157,40 @@ export async function seedDatabase() {
       ]
     );
 
-    // Seed Initial Notifications
+    // Seed Initial Notifications — user_id must reference users.id (the
+    // auth-scoped /notifications endpoint filters on it), so map the student's
+    // user row first instead of storing a students.id.
     const notifications = [
       { id: 'notif-1', title: 'Application Shortlisted', msg: 'TCS Digital shortlisted your profile for Technical Round 1!', type: 'success' },
       { id: 'notif-2', title: 'New MoU Partnership', msg: 'COEP University signed a 3-Year CoE MoU with Tata Motors R&D.', type: 'info' },
       { id: 'notif-3', title: 'New Capstone Challenge', msg: 'L&T posted "Decentralized Carbon Ledger" with ₹3 Lakhs seed grant.', type: 'alert' },
     ];
+    const seedUser = await client.query(
+      `SELECT id FROM users WHERE LOWER(email) = $1 LIMIT 1`,
+      [INITIAL_STUDENT.email.toLowerCase()]
+    );
+    let seedUserId = seedUser.rows[0]?.id || null;
+    if (!seedUserId) {
+      const created = await client.query(
+        `INSERT INTO users (id, name, email, role, avatar)
+         VALUES ($1, $2, $3, 'student', $4)
+         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id`,
+        [
+          `usr-seed-${INITIAL_STUDENT.id}`,
+          INITIAL_STUDENT.name,
+          INITIAL_STUDENT.email.toLowerCase(),
+          INITIAL_STUDENT.avatar || null,
+        ]
+      );
+      seedUserId = created.rows[0].id;
+    }
     for (const n of notifications) {
       await client.query(
         `INSERT INTO notifications (id, user_id, title, message, type)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (id) DO NOTHING`,
-        [n.id, INITIAL_STUDENT.id, n.title, n.msg, n.type]
+        [n.id, seedUserId, n.title, n.msg, n.type]
       );
     }
 

@@ -84,7 +84,8 @@ export async function seedAlumniNetwork(): Promise<void> {
     }
 
     // One demo pending mentorship request to the first mentor (from the sample student)
-    const demoStudent = await query(`SELECT id, name, college, branch FROM students ORDER BY created_at ASC LIMIT 1`);
+    // students has no created_at column — sort by id for determinism
+    const demoStudent = await query(`SELECT id, name, college, branch FROM students ORDER BY id ASC LIMIT 1`);
     if (demoStudent.rows.length > 0 && alumniIds.length > 0) {
       const stu = demoStudent.rows[0];
       await query(

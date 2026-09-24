@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext';
+import { formatDisplayDate } from '../../utils/formatDate';
 import { 
   FileCheck2, 
   Clock, 
@@ -127,7 +128,7 @@ export const PlacementTracker: React.FC = () => {
                         <span>{app.company}</span>
                         <span className="text-slate-300">•</span>
                         <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                        <span>Applied on {app.appliedDate}</span>
+                        <span>Applied on {formatDisplayDate(app.appliedDate)}</span>
                       </p>
                     </div>
 

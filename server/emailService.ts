@@ -3,12 +3,17 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// SMTP settings come from the environment. The embedded defaults preserve the
+// original demo behavior for local development — set EMAIL_USER / EMAIL_PASS
+// (Gmail App Password) explicitly in production.
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10) || 587;
 const EMAIL_USER = process.env.EMAIL_USER || 'refakshat1609@gmail.com';
 const EMAIL_PASS = (process.env.EMAIL_PASS || 'ugemlyhtnoiykjic').replace(/\s+/g, '');
 
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
+  host: SMTP_HOST,
+  port: SMTP_PORT,
   secure: false, // TLS
   requireTLS: true,
   auth: {
@@ -28,7 +33,7 @@ export async function sendOtpEmail({
   toEmail: string;
   otp: string;
   userName?: string;
-}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+}): Promise<{ success: boolean; messageId?: string; error?: string; devOtp?: string }> {
   const htmlContent = `
     <!DOCTYPE html>
     <html lang="en">
@@ -133,6 +138,11 @@ export async function sendOtpEmail({
     return { success: true, messageId: info.messageId };
   } catch (error: any) {
     console.error(`[EmailService] Failed to send OTP to ${toEmail}:`, error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      // Dev fallback: an unreachable SMTP server must never block local signups.
+      console.warn(`[EmailService] DEV MODE OTP for ${toEmail}: ${otp}`);
+      return { success: true, devOtp: otp, error: `SMTP unavailable — dev fallback active (${error.message})` };
+    }
     return { success: false, error: error.message };
   }
 }
@@ -145,7 +155,7 @@ export async function sendRegistrationOtpEmail({
   toEmail: string;
   otp: string;
   userName?: string;
-}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+}): Promise<{ success: boolean; messageId?: string; error?: string; devOtp?: string }> {
   const htmlContent = `
     <!DOCTYPE html>
     <html lang="en">
@@ -250,6 +260,159 @@ export async function sendRegistrationOtpEmail({
     return { success: true, messageId: info.messageId };
   } catch (error: any) {
     console.error(`[EmailService] Failed to send registration OTP to ${toEmail}:`, error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      // Dev fallback: local signups keep working when Gmail SMTP is down/rate-limited.
+      console.warn(`[EmailService] DEV MODE registration OTP for ${toEmail}: ${otp}`);
+      return { success: true, devOtp: otp, error: `SMTP unavailable — dev fallback active (${error.message})` };
+    }
+    return { success: false, error: error.message };
+  }
+}
+
+export async function sendJobAlertEmail({
+  toEmail,
+  userName = 'there',
+  matches,
+  unsubscribeUrl,
+}: {
+  toEmail: string;
+  userName?: string;
+  matches: { title: string; company: string; location: string; salary: string; matchScore: number }[];
+  unsubscribeUrl: string;
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const rows = matches.map(m => `
+    <tr>
+      <td style="padding:14px 16px;border-bottom:1px solid #1e293b;">
+        <div style="color:#e2e8f0;font-size:14px;font-weight:700;">${m.title}</div>
+        <div style="color:#94a3b8;font-size:12px;margin-top:2px;">${m.company} • ${m.location} • ${m.salary}</div>
+      </td>
+      <td style="padding:14px 16px;border-bottom:1px solid #1e293b;text-align:right;">
+        <span style="display:inline-block;padding:6px 12px;background:rgba(16,185,129,0.15);border:1px solid rgba(52,211,153,0.4);border-radius:100px;color:#6ee7b7;font-size:13px;font-weight:800;">${m.matchScore}% match</span>
+      </td>
+    </tr>`).join('');
+
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>S.P.A.R.K. Job Alerts</title></head>
+    <body style="margin:0;padding:0;background-color:#0b0f19;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+      <table border="0" cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td align="center" style="padding:40px 10px;">
+            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:560px;background-color:#131b2e;border:1px solid #1e293b;border-radius:24px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 36px;background:linear-gradient(135deg,#1d4ed8 0%,#312e81 100%);border-bottom:1px solid rgba(255,255,255,0.1);">
+                  <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:800;">Your daily job matches 🎯</h1>
+                  <p style="margin:6px 0 0 0;color:#cbd5e1;font-size:12px;">New openings scoring above 80% with your verified skills</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:28px 20px;">
+                  <p style="margin:0 0 14px 8px;color:#e2e8f0;font-size:14px;">Hi <strong style="color:#60a5fa;">${userName}</strong>, ${matches.length} new opportunity(ies) fit you well:</p>
+                  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background:#0b0f19;border-radius:14px;border:1px solid #1e293b;">${rows}</table>
+                  <p style="margin:18px 8px 0 8px;">
+                    <a href="${process.env.PUBLIC_APP_URL || 'http://localhost:5174'}/dashboard" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;border-radius:12px;font-size:13px;font-weight:700;text-decoration:none;">Open S.P.A.R.K. & apply →</a>
+                  </p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:20px 36px;background-color:#0b0f19;border-top:1px solid #1e293b;text-align:center;">
+                  <p style="margin:0;color:#64748b;font-size:11px;">
+                    You receive this because daily job alerts are enabled for your account.<br/>
+                    <a href="${unsubscribeUrl}" style="color:#94a3b8;">Unsubscribe from job alerts</a>
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"S.P.A.R.K. Job Alerts" <${EMAIL_USER}>`,
+      to: toEmail,
+      subject: `[S.P.A.R.K.] ${matches.length} new job match${matches.length === 1 ? '' : 'es'} above 80% for you`,
+      text: `Hi ${userName}, ${matches.length} new opportunity(ies) match your skills above 80%:\n\n${matches.map(m => `- ${m.title} at ${m.company} (${m.location}) — ${m.matchScore}% match`).join('\n')}\n\nUnsubscribe: ${unsubscribeUrl}`,
+      html: htmlContent,
+    });
+    console.log(`[EmailService] Job alert digest dispatched to ${toEmail} (${matches.length} matches)`);
+    return { success: true, messageId: info.messageId };
+  } catch (error: any) {
+    console.error(`[EmailService] Failed to send job alert to ${toEmail}:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+export async function sendSecurityAlertEmail({
+  toEmail,
+  userName = 'there',
+  reason,
+}: {
+  toEmail: string;
+  userName?: string;
+  reason: 'password-changed' | 'account-overwritten';
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const isOverwrite = reason === 'account-overwritten';
+  const subject = isOverwrite
+    ? `[S.P.A.R.K.] Security alert: your account was re-registered`
+    : `[S.P.A.R.K.] Security alert: your password was changed`;
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>S.P.A.R.K. Security Alert</title></head>
+    <body style="margin:0;padding:0;background-color:#0b0f19;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+      <table border="0" cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td align="center" style="padding:40px 10px;">
+            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:540px;background-color:#131b2e;border:1px solid #1e293b;border-radius:24px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 36px;background:linear-gradient(135deg,#7f1d1d 0%,#450a0a 100%);color:#ffffff;">
+                  <div style="display:inline-block;padding:6px 14px;background:rgba(239,68,68,0.2);border:1px solid rgba(248,113,113,0.4);border-radius:100px;color:#fecaca;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">
+                    Security Alert
+                  </div>
+                  <h1 style="margin:14px 0 4px 0;font-size:22px;font-weight:800;">${isOverwrite ? 'Your account was re-registered' : 'Your password was changed'}</h1>
+                  <p style="margin:0;font-size:12px;color:#fca5a5;">S.P.A.R.K. Account Security</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:36px;color:#e2e8f0;font-size:14px;line-height:1.6;">
+                  <p>Hello <strong>${userName}</strong>,</p>
+                  ${isOverwrite
+                    ? `<p>Your S.P.A.R.K. account (<strong>${toEmail}</strong>) was just re-registered through the signup flow, which <strong>replaced the profile details and password</strong> of the existing account.</p>`
+                    : `<p>The password for your S.P.A.R.K. account (<strong>${toEmail}</strong>) was changed on <strong>${new Date().toUTCString()}</strong>.</p>`}
+                  <p>If this was you, no action is needed. If you did <strong>not</strong> authorize this change, your account may be compromised — please reset your password immediately or contact your portal administrator.</p>
+                  <div style="margin-top:24px;padding:12px;background:#1e293b;border-radius:8px;font-size:12px;color:#94a3b8;">
+                    Timestamp: ${new Date().toUTCString()}<br/>
+                    Account: ${toEmail}
+                  </div>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:16px 0 0 0;color:#64748b;font-size:11px;">© ${new Date().getFullYear()} S.P.A.R.K. • Automated security notification</p>
+          </td>
+        </tr>
+      </table>
+    </html>
+  `;
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"S.P.A.R.K. Security" <${EMAIL_USER}>`,
+      to: toEmail,
+      subject,
+      text: isOverwrite
+        ? `Security alert: your S.P.A.R.K. account (${toEmail}) was re-registered and its password replaced. If this was not you, reset your password immediately.`
+        : `Security alert: your S.P.A.R.K. password was changed. If this was not you, reset your password immediately.`,
+      html: htmlContent,
+    });
+    console.log(`[EmailService] Security alert (${reason}) dispatched to ${toEmail}`);
+    return { success: true, messageId: info.messageId };
+  } catch (error: any) {
+    console.error(`[EmailService] Failed to send security alert to ${toEmail}:`, error.message);
     return { success: false, error: error.message };
   }
 }

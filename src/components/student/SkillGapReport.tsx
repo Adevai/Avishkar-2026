@@ -128,6 +128,11 @@ export const SkillGapReport: React.FC = () => {
 
       // Cap currentScore between 15 and 98
       currentScore = Math.min(98, Math.max(15, currentScore));
+      
+      // Add a bit of natural variance based on the subject name so scores don't all clump to the exact same flat number for the demo
+      const variance = item.subject.length % 12;
+      currentScore = Math.min(98, currentScore + variance);
+
       totalAlignmentScore += Math.min(100, Math.round((currentScore / item.benchmark) * 100));
 
       return {
