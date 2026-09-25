@@ -848,6 +848,80 @@ describe('Interview scheduling (POST /applications/schedule-interviews)', () => 
     const row = await pool.query(`SELECT status FROM interview_slots WHERE id = $1`, [slotId]);
     expect(row.rows[0].status).toBe('completed');
   });
+
+  dbIt('GET /me/interview-slots: student sees only their own booked slots with full details', async () => {
+    // A student with a linked login account, their application, and a real booking.
+    const stamp = Date.now();
+    const email = `e2e-slotviewer-${stamp}@spark.test`;
+    const userId = `usr-e2e-slotviewer-${stamp}`;
+    const studentId = `std-e2e-slotviewer-${stamp}`;
+    const appId = `app-e2e-slotview-${stamp}`;
+    const { hashPassword } = await import('./auth');
+    const hash = await hashPassword('SlotView!2026');
+    await pool.query(
+      `INSERT INTO users (id, name, email, role, password_hash) VALUES ($1, 'E2E Slot Viewer', $2, 'student', $3)`,
+      [userId, email, hash]
+    );
+    await pool.query(
+      `INSERT INTO students (id, user_id, name, email, college, degree, branch, semester, cgpa, graduation_year, target_role)
+       VALUES ($1, $2, 'E2E Slot Viewer', $3, 'E2E Institute', 'B.Tech', 'Computer Science & Engineering', 7, 8.1, 2026, 'Backend Developer')`,
+      [studentId, userId, email]
+    );
+    await pool.query(
+      `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+       VALUES ($1, $2, 'E2E Sched Role', 'E2E Corp', $3, 'E2E Slot Viewer', CURRENT_DATE, 'Applied', 81)`,
+      [appId, ownedJobId, studentId]
+    );
+
+    try {
+      const when = new Date(Date.now() + 48 * 3_600_000).toISOString();
+      const book = await request(app)
+        .post('/api/applications/schedule-interviews')
+        .set('Authorization', `Bearer ${recruiterToken}`)
+        .send({ ids: [appId], scheduledAt: when, mode: 'online', meetingUrl: 'https://meet.example.com/slotview' });
+      expect(book.status).toBe(201);
+
+      const unauth = await request(app).get('/api/me/interview-slots');
+      expect(unauth.status).toBe(401);
+
+      const login = await request(app).post('/api/login').send({ email, password: 'SlotView!2026' });
+      expect(login.status).toBe(200);
+      const studentToken = login.body.token;
+
+      const mine = await request(app).get('/api/me/interview-slots').set('Authorization', `Bearer ${studentToken}`);
+      expect(mine.status).toBe(200);
+      expect(mine.body.slots.length).toBe(1);
+      const slot = mine.body.slots[0];
+      expect(slot.jobTitle).toBe('E2E Sched Role');
+      expect(slot.company).toBe('E2E Corp');
+      expect(slot.mode).toBe('online');
+      expect(slot.meetingUrl).toBe('https://meet.example.com/slotview');
+      expect(slot.status).toBe('scheduled');
+      expect(slot.applicationId).toBe(appId);
+      expect(new Date(slot.scheduledAt).toISOString()).toBe(when);
+
+      // A different student account sees none of them
+      const otherStamp = Date.now() + 1;
+      const otherEmail = `e2e-slotviewer-${otherStamp}@spark.test`;
+      const otherHash = await hashPassword('SlotView!2026');
+      await pool.query(
+        `INSERT INTO users (id, name, email, role, password_hash) VALUES ($1, 'E2E Slot Other', $2, 'student', $3)`,
+        [`usr-e2e-slotother-${otherStamp}`, otherEmail, otherHash]
+      );
+      try {
+        const otherLogin = await request(app).post('/api/login').send({ email: otherEmail, password: 'SlotView!2026' });
+        const otherSlots = await request(app).get('/api/me/interview-slots').set('Authorization', `Bearer ${otherLogin.body.token}`);
+        expect(otherSlots.body.slots.length).toBe(0);
+      } finally {
+        await pool.query(`DELETE FROM users WHERE id = $1`, [`usr-e2e-slotother-${otherStamp}`]).catch(() => {});
+      }
+    } finally {
+      // application delete cascades interview_slots
+      await pool.query(`DELETE FROM applications WHERE id = $1`, [appId]).catch(() => {});
+      await pool.query(`DELETE FROM students WHERE id = $1`, [studentId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+    }
+  });
 });
 
 // ── RECRUITER FUNNEL ANALYTICS ──────────────────────────────────────────────

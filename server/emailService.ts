@@ -269,6 +269,117 @@ export async function sendRegistrationOtpEmail({
   }
 }
 
+export async function sendInterviewReminderEmail({
+  toEmail,
+  userName = 'there',
+  jobTitle,
+  company,
+  scheduledAt,
+  durationMinutes,
+  mode,
+  meetingUrl,
+  notes,
+  kind,
+}: {
+  toEmail: string;
+  userName?: string;
+  jobTitle: string;
+  company: string;
+  scheduledAt: string;
+  durationMinutes: number;
+  mode: string;
+  meetingUrl?: string;
+  notes?: string;
+  kind: '24h' | '2h';
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const when = new Date(scheduledAt);
+  const whenLabel = when.toLocaleString('en-IN', {
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata',
+  });
+  const countdown = kind === '24h' ? 'in about 24 hours' : 'in about 2 hours';
+  const modeLabel = mode === 'in-person' ? 'In-person' : mode === 'phone' ? 'Phone' : 'Online';
+  const meetingBlock = meetingUrl
+    ? `<p style="margin:0 0 12px 0;"><a href="${meetingUrl}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;border-radius:12px;font-size:13px;font-weight:700;text-decoration:none;">Join the meeting →</a></p>`
+    : '';
+  const notesBlock = notes
+    ? `<div style="margin:14px 0 0 0;padding:12px;background:#1e293b;border-radius:10px;font-size:12px;color:#94a3b8;"><strong style="color:#cbd5e1;">Notes from the recruiter:</strong> ${notes}</div>`
+    : '';
+  const urgencyColor = kind === '2h' ? '#f59e0b' : '#2563eb';
+
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>S.P.A.R.K. Interview Reminder</title></head>
+    <body style="margin:0;padding:0;background-color:#0b0f19;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+      <table border="0" cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td align="center" style="padding:40px 10px;">
+            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:560px;background-color:#131b2e;border:1px solid #1e293b;border-radius:24px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 36px;background:linear-gradient(135deg,${kind === '2h' ? '#92400e 0%,#78350f 100%' : '#1e3a8a 0%,#1e1b4b 100%'});border-bottom:1px solid rgba(255,255,255,0.1);">
+                  <div style="display:inline-block;padding:6px 14px;background:rgba(59,130,246,0.2);border:1px solid rgba(96,165,250,0.4);border-radius:100px;color:#93c5fd;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">
+                    Interview ${kind === '2h' ? 'Starting Soon' : 'Reminder'}
+                  </div>
+                  <h1 style="margin:14px 0 4px 0;color:#ffffff;font-size:22px;font-weight:800;">Your interview is ${countdown}</h1>
+                  <p style="margin:0;color:#cbd5e1;font-size:12px;">S.P.A.R.K. Interview Scheduler</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:36px;">
+                  <p style="margin:0 0 16px 0;color:#e2e8f0;font-size:15px;">Hello <strong style="color:#60a5fa;">${userName}</strong>,</p>
+                  <p style="margin:0 0 20px 0;color:#94a3b8;font-size:14px;line-height:1.6;">
+                    This is a friendly reminder that your interview <strong style="color:#e2e8f0;">${countdown}</strong>:
+                  </p>
+                  <div style="margin:0 0 20px 0;padding:20px;background:#0b0f19;border:1px solid #1e293b;border-radius:14px;">
+                    <div style="color:#e2e8f0;font-size:16px;font-weight:800;">${jobTitle}</div>
+                    <div style="color:#94a3b8;font-size:12px;margin:2px 0 14px 0;">${company}</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">🗓 <strong>${whenLabel}</strong> (IST)</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">⏱ ${durationMinutes} minutes</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">📍 ${modeLabel}${mode === 'online' && meetingUrl ? ' — link below' : ''}</div>
+                  </div>
+                  ${meetingBlock}
+                  ${notesBlock}
+                  <p style="margin:20px 0 0 0;color:#64748b;font-size:12px;line-height:1.6;">
+                    Good luck! Join a few minutes early, test your audio/video, and keep your resume handy.
+                  </p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:20px 36px;background-color:#0b0f19;border-top:1px solid #1e293b;text-align:center;">
+                  <p style="margin:0;color:#64748b;font-size:11px;">© ${new Date().getFullYear()} S.P.A.R.K. • Automated interview reminder</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"S.P.A.R.K. Interview Scheduler" <${EMAIL_USER}>`,
+      to: toEmail,
+      subject: `[S.P.A.R.K.] ${kind === '2h' ? '⏰ Starting soon:' : '📅 Reminder:'} your ${company} interview ${countdown}`,
+      text: `Hi ${userName}, your interview for ${jobTitle} at ${company} is ${countdown} — ${whenLabel} (IST), ${durationMinutes} min, ${modeLabel}.${meetingUrl ? ` Join: ${meetingUrl}` : ''}${notes ? ` Notes: ${notes}` : ''}`,
+      html: htmlContent,
+    });
+    console.log(`[EmailService] Interview ${kind} reminder dispatched to ${toEmail}`);
+    return { success: true, messageId: info.messageId };
+  } catch (error: any) {
+    console.error(`[EmailService] Failed to send interview ${kind} reminder to ${toEmail}:`, error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      // Dev fallback (same contract as the OTP emails): an unreachable SMTP
+      // server must not block the reminder pipeline locally.
+      console.warn(`[EmailService] DEV MODE interview ${kind} reminder for ${toEmail}: ${jobTitle} @ ${company}, ${scheduledAt} (${mode})${meetingUrl ? ` — ${meetingUrl}` : ''}`);
+      return { success: true, error: `SMTP unavailable — dev fallback active (${error.message})` };
+    }
+    return { success: false, error: error.message };
+  }
+}
+
 export async function sendJobAlertEmail({
   toEmail,
   userName = 'there',

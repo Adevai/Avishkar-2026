@@ -197,6 +197,31 @@ export const IndustryDashboard: React.FC = () => {
 
   useEffect(() => { if (activeTab === 'analytics') loadFunnel(); }, [activeTab]);
 
+  const exportFunnelCsv = () => {
+    if (funnel.length === 0) return;
+    const header = 'Job ID,Posting,Company,Applied,Shortlisted,Interviewed,Offers,Rejected,Offer Rate %';
+    const escape = (v: string | number) => {
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = funnel.map(p => [
+      p.jobId, p.title, p.company, p.applied, p.shortlisted, p.interviewed, p.offers, p.rejected,
+      p.applied > 0 ? p.conversionPct : '',
+    ].map(escape).join(','));
+    const blob = new Blob(
+      [[header, ...lines].join('\n')],
+      { type: 'text/csv;charset=utf-8;' }
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `hiring-funnel-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   // New Job Form State
   const [title, setTitle] = useState('');
   const [company, setCompany] = useState('');
@@ -485,13 +510,23 @@ export const IndustryDashboard: React.FC = () => {
                 <p className="text-xs text-slate-500 font-medium">Applied → Shortlisted → Interview → Offer — per posting, over time</p>
               </div>
             </div>
-            <button
-              onClick={loadFunnel}
-              disabled={loadingFunnel}
-              className="text-xs font-bold text-slate-500 hover:text-slate-800 px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors disabled:opacity-40"
-            >
-              {loadingFunnel ? 'Refreshing…' : '↻ Refresh'}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={exportFunnelCsv}
+                disabled={funnel.length === 0}
+                className="text-xs font-bold text-violet-700 hover:text-violet-900 px-3 py-1.5 rounded-xl hover:bg-violet-50 transition-colors disabled:opacity-40 border border-violet-200"
+                title="Download the current funnel table as CSV"
+              >
+                ⤓ Export CSV
+              </button>
+              <button
+                onClick={loadFunnel}
+                disabled={loadingFunnel}
+                className="text-xs font-bold text-slate-500 hover:text-slate-800 px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors disabled:opacity-40"
+              >
+                {loadingFunnel ? 'Refreshing…' : '↻ Refresh'}
+              </button>
+            </div>
           </div>
 
           <div className="overflow-x-auto">

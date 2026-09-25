@@ -10,6 +10,7 @@ import { seedAlumniNetwork } from './alumniSeed';
 import { seedAlumniActivity } from './alumniActivitySeed';
 import { startJobSyncScheduler } from './jobSync';
 import { startJobAlertScheduler } from './jobAlerts';
+import { startInterviewReminderScheduler } from './jobAlerts';
 import { startHeartbeat, connectedClients } from './events';
 import path from 'path';
 import fs from 'fs';
@@ -218,6 +219,7 @@ async function startServer() {
     // Optional background auto-sync of live job postings (AUTO_SYNC_CRON=true)
     startJobSyncScheduler();
     startJobAlertScheduler();
+    startInterviewReminderScheduler();
 
     // SSE keepalive pings every 30s so proxies keep event streams open
     startHeartbeat();

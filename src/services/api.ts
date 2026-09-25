@@ -323,6 +323,12 @@ export const api = {
     return await res.json();
   },
 
+  async getMyInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[] }> {
+    const res = await authFetch(`${API_BASE}/me/interview-slots`);
+    if (!res.ok) throw new Error('Failed to fetch your interview slots');
+    return await res.json();
+  },
+
   async getJobAlertsPreference(): Promise<{ jobAlertsEnabled: boolean }> {
     const res = await authFetch(`${API_BASE}/me/job-alerts`);
     if (!res.ok) return { jobAlertsEnabled: true };

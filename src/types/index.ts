@@ -303,6 +303,10 @@ export interface InterviewSlot {
   jobId: string;
   studentId: string;
   studentName?: string;
+  // Populated on the student-facing /me/interview-slots payload
+  jobTitle?: string;
+  company?: string;
+  location?: string;
   scheduledAt: string;
   durationMinutes: number;
   mode: InterviewMode;

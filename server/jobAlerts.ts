@@ -149,6 +149,102 @@ export async function sendJobAlertDigest(): Promise<{ emailed: number; skipped: 
   return { emailed, skipped };
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// Interview reminders (real rows from interview_slots; idempotent sends)
+// ═════════════════════════════════════════════════════════════════════
+
+export async function sendInterviewReminders(): Promise<{ sent24h: number; sent2h: number }> {
+  const { sendInterviewReminderEmail } = await import('./emailService');
+  let sent24h = 0;
+  let sent2h = 0;
+
+  const send = async (slot: any, kind: '24h' | '2h'): Promise<boolean> => {
+    // Resolve the student's login account for their email address.
+    const u = await pool.query(
+      `SELECT u.email, COALESCE(s.name, split_part(u.email, '@', 1)) AS name
+         FROM interview_slots s2
+         JOIN users u ON u.id = (SELECT user_id FROM students WHERE id = s2.student_id)
+         LEFT JOIN students s ON s.id = s2.student_id
+        WHERE s2.id = $1`,
+      [slot.id]
+    ).catch(() => ({ rows: [] as any[] }));
+    const to = u.rows[0]?.email;
+    if (!to) return false; // no linked account — nothing to email
+
+    const result = await sendInterviewReminderEmail({
+      toEmail: to,
+      userName: u.rows[0].name,
+      jobTitle: slot.job_title,
+      company: slot.company,
+      scheduledAt: new Date(slot.scheduled_at).toISOString(),
+      durationMinutes: slot.duration_minutes || 45,
+      mode: slot.mode || 'online',
+      meetingUrl: slot.meeting_url || undefined,
+      notes: slot.notes || undefined,
+      kind,
+    });
+    if (!result.success) return false;
+
+    const sentCol = kind === '24h' ? 'reminder_24h_sent_at' : 'reminder_2h_sent_at';
+    await pool.query(`UPDATE interview_slots SET ${sentCol} = CURRENT_TIMESTAMP WHERE id = $1`, [slot.id]).catch(() => {});
+    return true;
+  };
+
+  try {
+    // 24-hour reminders: upcoming slots inside the window, not yet reminded.
+    const due24h = await pool.query(
+      `SELECT s.id, s.scheduled_at, s.duration_minutes, s.mode, s.meeting_url, s.notes,
+              j.title AS job_title, j.company
+         FROM interview_slots s
+         JOIN applications a ON a.id = s.application_id
+         JOIN jobs j ON j.id = s.job_id
+        WHERE s.status = 'scheduled'
+          AND s.reminder_24h_sent_at IS NULL
+          AND s.scheduled_at BETWEEN NOW() AND NOW() + INTERVAL '24 hours'`
+    );
+    for (const slot of due24h.rows) {
+      if (await send(slot, '24h')) sent24h += 1;
+    }
+
+    // 2-hour reminders: final call, not yet reminded, still in the future.
+    const due2h = await pool.query(
+      `SELECT s.id, s.scheduled_at, s.duration_minutes, s.mode, s.meeting_url, s.notes,
+              j.title AS job_title, j.company
+         FROM interview_slots s
+         JOIN applications a ON a.id = s.application_id
+         JOIN jobs j ON j.id = s.job_id
+        WHERE s.status = 'scheduled'
+          AND s.reminder_2h_sent_at IS NULL
+          AND s.scheduled_at BETWEEN NOW() AND NOW() + INTERVAL '2 hours'`
+    );
+    for (const slot of due2h.rows) {
+      if (await send(slot, '2h')) sent2h += 1;
+    }
+  } catch (err: any) {
+    console.error('[interviewReminders] run failed:', err?.message);
+  }
+  return { sent24h, sent2h };
+}
+
+let reminderTimer: NodeJS.Timeout | null = null;
+
+export function startInterviewReminderScheduler(): void {
+  if (process.env.INTERVIEW_REMINDER_CRON === 'false') {
+    console.log('[interviewReminders] Scheduler disabled (INTERVIEW_REMINDER_CRON=false).');
+    return;
+  }
+  const interval = process.env.NODE_ENV === 'production' ? 15 * 60_000 : 2 * 60_000;
+  console.log(`[interviewReminders] Scheduler armed — every ${interval / 60000}min.`);
+  reminderTimer = setInterval(async () => {
+    try {
+      await sendInterviewReminders();
+    } catch (err: any) {
+      console.error('[interviewReminders] tick failed:', err?.message);
+    }
+  }, interval);
+  reminderTimer.unref();
+}
+
 let digestTimer: NodeJS.Timeout | null = null;
 
 export function startJobAlertScheduler(): void {

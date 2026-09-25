@@ -1784,6 +1784,60 @@ router.patch('/me/job-alerts', requireAuth, async (req: Request, res: Response) 
   }
 });
 
+// ── My Interviews: booked slots for the logged-in student ──────────────────
+router.get('/me/interview-slots', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    // Real rows only: slots whose application belongs to this student's profile.
+    const result = await query(
+      `SELECT s.id, s.application_id, s.job_id, s.student_id, s.scheduled_at,
+              s.duration_minutes, s.mode, s.meeting_url, s.notes, s.status, s.created_at,
+              j.title AS job_title, j.company, j.location
+         FROM interview_slots s
+         JOIN applications a ON a.id = s.application_id
+         JOIN jobs j ON j.id = s.job_id
+        WHERE a.student_id = (SELECT id FROM students WHERE user_id = $1)
+        ORDER BY (s.status = 'scheduled') DESC, s.scheduled_at DESC`,
+      [user.sub]
+    );
+    const slots = result.rows.map(r => ({
+      id: r.id,
+      applicationId: r.application_id,
+      jobId: r.job_id,
+      jobTitle: r.job_title,
+      company: r.company,
+      location: r.location,
+      scheduledAt: r.scheduled_at,
+      durationMinutes: r.duration_minutes,
+      mode: r.mode,
+      meetingUrl: r.meeting_url,
+      notes: r.notes,
+      status: r.status,
+      createdAt: r.created_at,
+    }));
+    res.json({ success: true, slots });
+  } catch (error: any) {
+    console.error('GET /me/interview-slots failed:', error.message);
+    res.status(500).json({ error: 'Failed to load your interview slots.' });
+  }
+});
+
+// Manual reminder sweep for testing: POST /api/interview-reminders/run?secret=<JWT_SECRET>
+router.post('/interview-reminders/run', async (req: Request, res: Response) => {
+  const secret = process.env.JWT_SECRET?.trim();
+  const provided = String(req.query.secret || req.body?.secret || '');
+  if (!secret || provided !== secret) {
+    return res.status(403).json({ error: 'Admin secret required.' });
+  }
+  try {
+    const { sendInterviewReminders } = await import('./jobAlerts');
+    const result = await sendInterviewReminders();
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==========================================
 // 10. ANALYTICS & COPILOT
 // ==========================================

@@ -357,6 +357,12 @@ export async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_slots_student ON interview_slots(student_id);
     `);
 
+    // Interview reminder tracking (idempotent sends: '24h' | '2h' | null when sent)
+    await client.query(`
+      ALTER TABLE interview_slots ADD COLUMN IF NOT EXISTS reminder_24h_sent_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE interview_slots ADD COLUMN IF NOT EXISTS reminder_2h_sent_at TIMESTAMP WITH TIME ZONE;
+    `);
+
     // Server-side institution verification flag (distinct from client-side id_card_verified)
     await client.query(`
       ALTER TABLE students ADD COLUMN IF NOT EXISTS institution_verified BOOLEAN DEFAULT FALSE;
