@@ -685,3 +685,265 @@ describe('Job-alerts preference (GET/PATCH /me/job-alerts)', () => {
     await request(app).patch('/api/me/job-alerts').set('Authorization', `Bearer ${token}`).send({ enabled: true });
   });
 });
+
+// ── INTERVIEW SLOT SCHEDULING ───────────────────────────────────────────────
+describe('Interview scheduling (POST /applications/schedule-interviews)', () => {
+  let recruiterToken = '';
+  let otherToken = '';
+  let ownedJobId = '';
+  const jobIds: string[] = [];
+  const appIds: string[] = [];
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    const { hashPassword } = await import('./auth');
+    const stamp = Date.now();
+    for (const [suffix, name] of [[`own-${stamp}`, 'E2E Sched Own'], [`other-${stamp}`, 'E2E Sched Other']] as const) {
+      const email = `e2e-rec-${suffix}@corp.test`;
+      const hash = await hashPassword('Recruiter!2026');
+      await pool.query(
+        `INSERT INTO users (id, name, email, role, password_hash)
+         VALUES ($1, $2, $3, 'industry', $4)
+         ON CONFLICT (email) DO UPDATE SET password_hash = $4`,
+        [`usr-e2e-rec-${suffix}`, name, email, hash]
+      );
+      const res = await request(app).post('/api/login').send({ email, password: 'Recruiter!2026' });
+      if (suffix.startsWith('own')) recruiterToken = res.body.token;
+      else otherToken = res.body.token;
+    }
+    const posted = await request(app).post('/api/jobs').set('Authorization', `Bearer ${recruiterToken}`).send({
+      title: 'E2E Sched Role', company: 'E2E Corp', location: 'Pune', type: 'Internship',
+      stipendOrSalary: '₹30,000 / month', openings: 2, description: 'E2E scheduling role',
+      requiredSkills: [{ name: 'React.js', weight: 0.5, minScore: 60 }],
+      minCgpa: 6.0, eligibleBranches: ['Computer Science & Engineering'],
+    });
+    ownedJobId = posted.body.job.id;
+    jobIds.push(ownedJobId);
+
+    const foreignJobId = `job-e2e-sched-foreign-${stamp}`;
+    await pool.query(
+      `INSERT INTO jobs (id, title, company, location, type, stipend_or_salary, description, required_skills, eligible_branches, posted_by)
+       VALUES ($1, 'E2E Sched Foreign', 'Elsewhere Corp', 'Mumbai', 'Internship', '₹10k', '', '[]'::jsonb, '[]'::jsonb, 'usr-someone-else')
+       ON CONFLICT (id) DO NOTHING`,
+      [foreignJobId]
+    );
+    jobIds.push(foreignJobId);
+
+    for (const [id, jobId] of [
+      [`app-e2e-sch1-${stamp}`, ownedJobId],
+      [`app-e2e-sch2-${stamp}`, ownedJobId],
+      [`app-e2e-schf-${stamp}`, foreignJobId],
+    ] as const) {
+      await pool.query(
+        `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+         VALUES ($1, $2, 'E2E Sched Role', 'E2E Corp', 'std-e2e-cand-s', 'E2E Candidate S', CURRENT_DATE, 'Applied', 75)
+         ON CONFLICT (id) DO NOTHING`,
+        [id, jobId]
+      );
+      appIds.push(id);
+    }
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    await pool.query(`DELETE FROM interview_slots WHERE application_id = ANY($1)`, [appIds]).catch(() => {});
+    await pool.query(`DELETE FROM applications WHERE id = ANY($1)`, [appIds]).catch(() => {});
+    for (const id of jobIds) {
+      await pool.query(`DELETE FROM applications WHERE job_id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM jobs WHERE id = $1`, [id]).catch(() => {});
+    }
+    await pool.query(`DELETE FROM users WHERE email LIKE 'e2e-rec-own-%@corp.test' OR email LIKE 'e2e-rec-other-%@corp.test'`).catch(() => {});
+  });
+
+  dbIt('401 without auth; 400 on missing ids or past dates', async () => {
+    const unauth = await request(app)
+      .post('/api/applications/schedule-interviews')
+      .send({ ids: [appIds[0]], scheduledAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(unauth.status).toBe(401);
+
+    const auth = { Authorization: `Bearer ${recruiterToken}` };
+    const noIds = await request(app).post('/api/applications/schedule-interviews').set(auth).send({ scheduledAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(noIds.status).toBe(400);
+    const past = await request(app).post('/api/applications/schedule-interviews').set(auth).send({ ids: [appIds[0]], scheduledAt: '2020-01-01T10:00:00Z' });
+    expect(past.status).toBe(400);
+    const badDate = await request(app).post('/api/applications/schedule-interviews').set(auth).send({ ids: [appIds[0]], scheduledAt: 'not-a-date' });
+    expect(badDate.status).toBe(400);
+  });
+
+  dbIt('owner books real slots: rows inserted, status advanced, stage_history noted', async () => {
+    const c1 = appIds[0];
+    const c2 = appIds[1];
+    const when = new Date(Date.now() + 24 * 3_600_000).toISOString();
+    const res = await request(app)
+      .post('/api/applications/schedule-interviews')
+      .set('Authorization', `Bearer ${recruiterToken}`)
+      .send({ ids: [c1, c2], scheduledAt: when, durationMinutes: 60, mode: 'in-person', meetingUrl: 'https://meet.example.com/e2e', notes: 'Bring your portfolio' });
+    expect(res.status).toBe(201);
+    expect(res.body.scheduled).toBe(2);
+    expect(res.body.slots.length).toBe(2);
+
+    const slots = await pool.query(`SELECT * FROM interview_slots WHERE application_id = ANY($1) ORDER BY id`, [[c1, c2]]);
+    expect(slots.rows.length).toBe(2);
+    expect(slots.rows.every(s => s.status === 'scheduled')).toBe(true);
+    expect(slots.rows.every(s => s.duration_minutes === 60)).toBe(true);
+    expect(slots.rows.every(s => s.mode === 'in-person')).toBe(true);
+    expect(slots.rows.every(s => s.meeting_url === 'https://meet.example.com/e2e')).toBe(true);
+    expect(slots.rows.every(s => s.job_id === ownedJobId)).toBe(true);
+    expect(new Date(slots.rows[0].scheduled_at).toISOString()).toBe(when);
+
+    const apps = await pool.query(`SELECT id, status, stage_history FROM applications WHERE id = ANY($1)`, [[c1, c2]]);
+    expect(apps.rows.every(a => a.status === 'Interview Scheduled')).toBe(true);
+    const lastStage = apps.rows[0].stage_history[apps.rows[0].stage_history.length - 1];
+    expect(lastStage.stage).toBe('Interview Scheduled');
+    expect(String(lastStage.note)).toMatch(/Interview booked/i);
+  });
+
+  dbIt('non-owner gets 403; foreign-job applications are never booked', async () => {
+    const forbidden = await request(app)
+      .post('/api/applications/schedule-interviews')
+      .set('Authorization', `Bearer ${otherToken}`)
+      .send({ ids: [appIds[0]], scheduledAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(forbidden.status).toBe(403);
+
+    const foreignOnly = await request(app)
+      .post('/api/applications/schedule-interviews')
+      .set('Authorization', `Bearer ${recruiterToken}`)
+      .send({ ids: [appIds[2]], scheduledAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(foreignOnly.status).toBe(403);
+
+    // Mixed selection: only the owned one is booked
+    const mixed = await request(app)
+      .post('/api/applications/schedule-interviews')
+      .set('Authorization', `Bearer ${recruiterToken}`)
+      .send({ ids: [appIds[2], appIds[0]], scheduledAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(mixed.status).toBe(201);
+    expect(mixed.body.scheduled).toBe(1);
+    const foreignSlots = await pool.query(`SELECT count(*)::int AS n FROM interview_slots WHERE application_id = $1`, [appIds[2]]);
+    expect(foreignSlots.rows[0].n).toBe(0);
+  });
+
+  dbIt('GET /jobs/:jobId/interview-slots is owner-only and lists booked slots', async () => {
+    const otherView = await request(app).get(`/api/jobs/${ownedJobId}/interview-slots`).set('Authorization', `Bearer ${otherToken}`);
+    expect(otherView.status).toBe(403);
+
+    const mine = await request(app).get(`/api/jobs/${ownedJobId}/interview-slots`).set('Authorization', `Bearer ${recruiterToken}`);
+    expect(mine.status).toBe(200);
+    expect(mine.body.slots.length).toBe(3); // 2 from the first booking + 1 from the mixed one
+    expect(mine.body.slots.every((s: any) => s.jobId === ownedJobId)).toBe(true);
+    expect(mine.body.slots[0]).toHaveProperty('scheduledAt');
+  });
+
+  dbIt('PATCH /interview-slots/:slotId: owner completes/cancels; non-owner 404; bad status 400', async () => {
+    const slotRes = await pool.query(`SELECT id FROM interview_slots WHERE job_id = $1 LIMIT 1`, [ownedJobId]);
+    const slotId = slotRes.rows[0].id;
+
+    const bad = await request(app).patch(`/api/interview-slots/${slotId}`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'postponed' });
+    expect(bad.status).toBe(400);
+
+    const notMine = await request(app).patch(`/api/interview-slots/${slotId}`).set('Authorization', `Bearer ${otherToken}`).send({ status: 'completed' });
+    expect(notMine.status).toBe(404);
+
+    const ok = await request(app).patch(`/api/interview-slots/${slotId}`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'completed' });
+    expect(ok.status).toBe(200);
+    const row = await pool.query(`SELECT status FROM interview_slots WHERE id = $1`, [slotId]);
+    expect(row.rows[0].status).toBe('completed');
+  });
+});
+
+// ── RECRUITER FUNNEL ANALYTICS ──────────────────────────────────────────────
+describe('Recruiter funnel (GET /recruiter/funnel)', () => {
+  let recruiterToken = '';
+  let otherToken = '';
+  const jobIds: string[] = [];
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    const { hashPassword } = await import('./auth');
+    const stamp = Date.now();
+    for (const [suffix, name] of [[`own-${stamp}`, 'E2E Funnel Own'], [`other-${stamp}`, 'E2E Funnel Other']] as const) {
+      const email = `e2e-rec-${suffix}@corp.test`;
+      const hash = await hashPassword('Recruiter!2026');
+      await pool.query(
+        `INSERT INTO users (id, name, email, role, password_hash)
+         VALUES ($1, $2, $3, 'industry', $4)
+         ON CONFLICT (email) DO UPDATE SET password_hash = $4`,
+        [`usr-e2e-rec-${suffix}`, name, email, hash]
+      );
+      const res = await request(app).post('/api/login').send({ email, password: 'Recruiter!2026' });
+      if (suffix.startsWith('own')) recruiterToken = res.body.token;
+      else otherToken = res.body.token;
+    }
+    for (const title of ['E2E Funnel Role A', 'E2E Funnel Role B']) {
+      const res = await request(app).post('/api/jobs').set('Authorization', `Bearer ${recruiterToken}`).send({
+        title, company: 'E2E Corp', location: 'Pune', type: 'Internship',
+        stipendOrSalary: '₹30,000 / month', openings: 5, description: 'E2E funnel role',
+        requiredSkills: [{ name: 'React.js', weight: 0.5, minScore: 60 }],
+        minCgpa: 6.0, eligibleBranches: ['Computer Science & Engineering'],
+      });
+      jobIds.push(res.body.job.id);
+    }
+
+    // Role A: 6 applicants across the whole funnel; Role B: 1 interviewed
+    const rows: [string, string, string][] = [
+      [`app-e2e-fn1-${stamp}`, jobIds[0], 'Applied'],
+      [`app-e2e-fn2-${stamp}`, jobIds[0], 'Applied'],
+      [`app-e2e-fn3-${stamp}`, jobIds[0], 'Shortlisted'],
+      [`app-e2e-fn4-${stamp}`, jobIds[0], 'Interview Scheduled'],
+      [`app-e2e-fn5-${stamp}`, jobIds[0], 'Offer Extended'],
+      [`app-e2e-fn6-${stamp}`, jobIds[0], 'Rejected'],
+      [`app-e2e-fn7-${stamp}`, jobIds[1], 'Interview Scheduled'],
+    ];
+    for (const [id, jobId, status] of rows) {
+      await pool.query(
+        `INSERT INTO applications (id, job_id, job_title, company, student_id, student_name, applied_date, status, ai_match_score)
+         VALUES ($1, $2, 'E2E Funnel Role', 'E2E Corp', 'std-e2e-cand-f', 'E2E Candidate F', CURRENT_DATE, $3, 80)
+         ON CONFLICT (id) DO NOTHING`,
+        [id, jobId, status]
+      );
+    }
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    for (const id of jobIds) {
+      await pool.query(`DELETE FROM interview_slots WHERE job_id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM applications WHERE job_id = $1`, [id]).catch(() => {});
+      await pool.query(`DELETE FROM jobs WHERE id = $1`, [id]).catch(() => {});
+    }
+    await pool.query(`DELETE FROM users WHERE email LIKE 'e2e-rec-own-%@corp.test' OR email LIKE 'e2e-rec-other-%@corp.test'`).catch(() => {});
+  });
+
+  dbIt('401 without auth', async () => {
+    const res = await request(app).get('/api/recruiter/funnel');
+    expect(res.status).toBe(401);
+  });
+
+  dbIt('returns per-posting funnel counts and weekly trend for the owner only', async () => {
+    const mine = await request(app).get('/api/recruiter/funnel').set('Authorization', `Bearer ${recruiterToken}`);
+    expect(mine.status).toBe(200);
+    const a = mine.body.postings.find((p: any) => p.jobId === jobIds[0]);
+    const b = mine.body.postings.find((p: any) => p.jobId === jobIds[1]);
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+
+    expect(a.applied).toBe(6);
+    expect(a.shortlisted).toBe(3); // Shortlisted + Interview Scheduled + Offer Extended
+    expect(a.interviewed).toBe(2); // Interview Scheduled + Offer Extended
+    expect(a.offers).toBe(1);
+    expect(a.rejected).toBe(1);
+    expect(a.conversionPct).toBe(16.7); // 1/6 rounded to 1dp
+
+    expect(b.applied).toBe(1);
+    expect(b.interviewed).toBe(1);
+    expect(b.offers).toBe(0);
+    expect(b.conversionPct).toBe(0);
+
+    const trendTotal = mine.body.weeklyTrend.reduce((sum: number, w: any) => sum + w.applications, 0);
+    expect(trendTotal).toBe(7);
+    expect(mine.body.weeklyTrend.every((w: any) => /^\d{4}-\d{2}-\d{2}$/.test(w.week))).toBe(true);
+
+    // The other recruiter's funnel must not include these postings
+    const theirs = await request(app).get('/api/recruiter/funnel').set('Authorization', `Bearer ${otherToken}`);
+    expect(theirs.body.postings.some((p: any) => jobIds.includes(p.jobId))).toBe(false);
+  });
+});

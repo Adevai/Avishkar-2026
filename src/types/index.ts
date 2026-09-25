@@ -295,6 +295,41 @@ export interface JobApplication {
   stageHistory?: { stage: ApplicationStage; date: string; note?: string }[];
 }
 
+export type InterviewMode = 'online' | 'in-person' | 'phone';
+
+export interface InterviewSlot {
+  id: string;
+  applicationId: string;
+  jobId: string;
+  studentId: string;
+  studentName?: string;
+  scheduledAt: string;
+  durationMinutes: number;
+  mode: InterviewMode;
+  meetingUrl?: string | null;
+  notes?: string | null;
+  status: 'scheduled' | 'completed' | 'cancelled';
+  createdAt?: string;
+}
+
+export interface FunnelPosting {
+  jobId: string;
+  title: string;
+  company: string;
+  applied: number;
+  shortlisted: number;
+  interviewed: number;
+  offers: number;
+  rejected: number;
+  conversionPct: number;
+}
+
+export interface RecruiterFunnelResponse {
+  success: boolean;
+  postings: FunnelPosting[];
+  weeklyTrend: { week: string; applications: number }[];
+}
+
 export interface MoU {
   id: string;
   collegeName: string;

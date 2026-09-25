@@ -336,6 +336,27 @@ export async function initDatabase() {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS job_alerts_enabled BOOLEAN DEFAULT TRUE;
     `);
 
+    // Interview slots booked by recruiters from the candidate pipeline
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS interview_slots (
+        id VARCHAR(64) PRIMARY KEY,
+        application_id VARCHAR(64) NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+        job_id VARCHAR(64) NOT NULL,
+        student_id VARCHAR(64) NOT NULL,
+        scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        duration_minutes INT DEFAULT 45,
+        mode VARCHAR(32) DEFAULT 'online',
+        meeting_url TEXT,
+        notes TEXT,
+        status VARCHAR(16) NOT NULL DEFAULT 'scheduled',   -- scheduled | completed | cancelled
+        created_by VARCHAR(64) NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_slots_application ON interview_slots(application_id);
+      CREATE INDEX IF NOT EXISTS idx_slots_job ON interview_slots(job_id);
+      CREATE INDEX IF NOT EXISTS idx_slots_student ON interview_slots(student_id);
+    `);
+
     // Server-side institution verification flag (distinct from client-side id_card_verified)
     await client.query(`
       ALTER TABLE students ADD COLUMN IF NOT EXISTS institution_verified BOOLEAN DEFAULT FALSE;

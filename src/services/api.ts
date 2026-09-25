@@ -2,6 +2,8 @@ import {
   StudentProfile,
   JobOpportunity,
   JobApplication,
+  InterviewSlot,
+  RecruiterFunnelResponse,
   MoU,
   ProblemStatement,
   AssessmentResult,
@@ -283,6 +285,41 @@ export const api = {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || 'Bulk update failed');
     }
+    return await res.json();
+  },
+
+  async scheduleInterviews(payload: { ids: string[]; scheduledAt: string; durationMinutes?: number; mode?: 'online' | 'in-person' | 'phone'; meetingUrl?: string; notes?: string }): Promise<{ success: boolean; scheduled: number; slots: InterviewSlot[] }> {
+    const res = await authFetch(`${API_BASE}/applications/schedule-interviews`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to schedule interviews');
+    }
+    return await res.json();
+  },
+
+  async getJobInterviewSlots(jobId: string): Promise<{ success: boolean; slots: InterviewSlot[] }> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}/interview-slots`);
+    if (!res.ok) throw new Error('Failed to fetch interview slots');
+    return await res.json();
+  },
+
+  async updateInterviewSlot(slotId: string, status: 'completed' | 'cancelled'): Promise<{ success: boolean; slot: { id: string; status: string } }> {
+    const res = await authFetch(`${API_BASE}/interview-slots/${slotId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    if (!res.ok) throw new Error('Failed to update interview slot');
+    return await res.json();
+  },
+
+  async getRecruiterFunnel(): Promise<RecruiterFunnelResponse> {
+    const res = await authFetch(`${API_BASE}/recruiter/funnel`);
+    if (!res.ok) throw new Error('Failed to fetch funnel analytics');
     return await res.json();
   },
 

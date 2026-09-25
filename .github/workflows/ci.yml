@@ -6,10 +6,22 @@ on:
   pull_request:
     branches: [main, master]
 
+# Cancel superseded runs on the same branch/PR to save minutes
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   quality:
     name: Typecheck, Lint, Test, Build
     runs-on: ubuntu-latest
+
+    # Hard stop so a hung test/server can't burn the 6h default limit
+    timeout-minutes: 20
 
     services:
       postgres:
@@ -33,7 +45,6 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       JWT_SECRET: ci-secret-0123456789abcdef0123456789abcdef
-      NODE_ENV: test
 
     steps:
       - name: Checkout
@@ -57,8 +68,16 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # NODE_ENV is scoped to the test step only — a job-level NODE_ENV=test
+      # leaks into `vite build` and produces a wrong-mode production bundle.
       - name: Unit + API tests (against PostgreSQL service)
         run: npm test
+        env:
+          NODE_ENV: test
+          # e2e tests boot the Express app via supertest but must NOT listen
+          # (no START_SERVER) and must init the schema on the empty CI DB —
+          # server/api.e2e.test.ts calls initDatabase() in beforeAll.
+          START_SERVER: 'false'
 
       - name: Production build
         run: npm run build

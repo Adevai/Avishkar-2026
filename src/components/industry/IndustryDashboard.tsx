@@ -16,9 +16,12 @@ import {
   Pencil,
   Archive,
   Trash2,
-  Search
+  Search,
+  Calendar,
+  BarChart3,
+  TrendingUp
 } from 'lucide-react';
-import { JobType, JobOpportunity } from '../../types';
+import { JobType, JobOpportunity, InterviewSlot, FunnelPosting } from '../../types';
 import { formatDisplayDate } from '../../utils/formatDate';
 
 export const IndustryDashboard: React.FC = () => {
@@ -36,6 +39,20 @@ export const IndustryDashboard: React.FC = () => {
   const [pipelineJobId, setPipelineJobId] = useState<string | null>(null);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
   const [isBulkWorking, setIsBulkWorking] = useState(false);
+
+  // Interview scheduling form — books real slots via POST /applications/schedule-interviews
+  const [showScheduleForm, setShowScheduleForm] = useState(false);
+  const [schedAt, setSchedAt] = useState('');
+  const [schedDuration, setSchedDuration] = useState('45');
+  const [schedMode, setSchedMode] = useState<'online' | 'in-person' | 'phone'>('online');
+  const [schedUrl, setSchedUrl] = useState('');
+  const [schedNotes, setSchedNotes] = useState('');
+  const [jobSlots, setJobSlots] = useState<InterviewSlot[]>([]);
+
+  // Hiring funnel analytics (GET /recruiter/funnel)
+  const [funnel, setFunnel] = useState<FunnelPosting[]>([]);
+  const [funnelTrend, setFunnelTrend] = useState<{ week: string; applications: number }[]>([]);
+  const [loadingFunnel, setLoadingFunnel] = useState(false);
 
   const loadMine = async () => {
     setLoadingMine(true);
@@ -126,6 +143,59 @@ export const IndustryDashboard: React.FC = () => {
       setIsBulkWorking(false);
     }
   };
+
+  const openScheduleForm = async () => {
+    setShowScheduleForm(true);
+    setSchedAt('');
+    setSchedUrl('');
+    setSchedNotes('');
+    try {
+      const res = await api.getJobInterviewSlots(pipelineJobId!);
+      setJobSlots(res.slots || []);
+    } catch {
+      setJobSlots([]);
+    }
+  };
+
+  const runSchedule = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (selectedCandidateIds.size === 0 || isBulkWorking || !schedAt) return;
+    setIsBulkWorking(true);
+    try {
+      const res = await api.scheduleInterviews({
+        ids: Array.from(selectedCandidateIds),
+        scheduledAt: new Date(schedAt).toISOString(),
+        durationMinutes: Number(schedDuration) || 45,
+        mode: schedMode,
+        meetingUrl: schedUrl.trim() || undefined,
+        notes: schedNotes.trim() || undefined,
+      });
+      setNotification(`Interview booked for ${res.scheduled} candidate(s) — students notified with the slot.`);
+      setSelectedCandidateIds(new Set());
+      setShowScheduleForm(false);
+      setJobSlots(res.slots || []);
+      await loadMine();
+    } catch (e: any) {
+      setNotification(e?.message || 'Failed to schedule interviews.');
+    } finally {
+      setIsBulkWorking(false);
+    }
+  };
+
+  const loadFunnel = async () => {
+    setLoadingFunnel(true);
+    try {
+      const res = await api.getRecruiterFunnel();
+      setFunnel(res.postings || []);
+      setFunnelTrend(res.weeklyTrend || []);
+    } catch (e: any) {
+      console.warn('Funnel load failed:', e?.message);
+    } finally {
+      setLoadingFunnel(false);
+    }
+  };
+
+  useEffect(() => { if (activeTab === 'analytics') loadFunnel(); }, [activeTab]);
 
   // New Job Form State
   const [title, setTitle] = useState('');
@@ -219,6 +289,7 @@ export const IndustryDashboard: React.FC = () => {
           {[
             { id: 'dashboard', label: 'Recruitment Hub', icon: <Building2 className="w-4 h-4" /> },
             { id: 'talent-search', label: 'AI Talent Search', icon: <Sparkles className="w-4 h-4" /> },
+            { id: 'analytics', label: 'Hiring Funnel Analytics', icon: <BarChart3 className="w-4 h-4" /> },
             { id: 'post-job', label: 'Post Vacancy', icon: <PlusCircle className="w-4 h-4" /> },
             { id: 'problem-statements', label: 'R&D Capstone Challenges', icon: <Briefcase className="w-4 h-4" /> },
             { id: 'mous', label: 'Academia MoUs', icon: <Users className="w-4 h-4" /> },
@@ -400,6 +471,107 @@ export const IndustryDashboard: React.FC = () => {
               </button>
             </div>
           </form>
+        </div>
+      ) : activeTab === 'analytics' ? (
+        /* CONDITIONAL VIEW: HIRING FUNNEL ANALYTICS */
+        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-md space-y-6 animate-fadeIn">
+          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-2xl bg-violet-50 text-violet-600">
+                <BarChart3 className="w-6 h-6" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">Hiring Funnel Analytics</h2>
+                <p className="text-xs text-slate-500 font-medium">Applied → Shortlisted → Interview → Offer — per posting, over time</p>
+              </div>
+            </div>
+            <button
+              onClick={loadFunnel}
+              disabled={loadingFunnel}
+              className="text-xs font-bold text-slate-500 hover:text-slate-800 px-3 py-1.5 rounded-xl hover:bg-slate-100 transition-colors disabled:opacity-40"
+            >
+              {loadingFunnel ? 'Refreshing…' : '↻ Refresh'}
+            </button>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-500 font-semibold uppercase tracking-wider">
+                  <th className="py-2.5 px-3">Posting</th>
+                  <th className="py-2.5 px-3 text-center">Applied</th>
+                  <th className="py-2.5 px-3 text-center">Shortlisted</th>
+                  <th className="py-2.5 px-3 text-center">Interviewed</th>
+                  <th className="py-2.5 px-3 text-center">Offers</th>
+                  <th className="py-2.5 px-3 text-center">Rejected</th>
+                  <th className="py-2.5 px-3 text-center">Offer Rate</th>
+                  <th className="py-2.5 px-3">Funnel</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {funnel.length === 0 ? (
+                  <tr><td colSpan={8} className="py-8 text-center text-slate-400">{loadingFunnel ? 'Loading funnel…' : 'No postings yet — publish a vacancy to see conversion analytics.'}</td></tr>
+                ) : funnel.map(p => (
+                  <tr key={p.jobId} className="hover:bg-slate-50/60">
+                    <td className="py-3 px-3">
+                      <p className="font-bold text-slate-900">{p.title}</p>
+                      <p className="text-[10px] text-slate-400">{p.company}</p>
+                    </td>
+                    <td className="py-3 px-3 text-center font-bold text-slate-900">{p.applied}</td>
+                    <td className="py-3 px-3 text-center font-bold text-blue-700">{p.shortlisted}</td>
+                    <td className="py-3 px-3 text-center font-bold text-purple-700">{p.interviewed}</td>
+                    <td className="py-3 px-3 text-center font-bold text-emerald-700">{p.offers}</td>
+                    <td className="py-3 px-3 text-center font-bold text-rose-600">{p.rejected}</td>
+                    <td className="py-3 px-3 text-center font-bold text-slate-700">{p.applied > 0 ? `${p.conversionPct}%` : '—'}</td>
+                    <td className="py-3 px-3">
+                      {(() => {
+                        const stages = [p.applied, p.shortlisted, p.interviewed, p.offers];
+                        const max = Math.max(...stages, 1);
+                        const colors = ['bg-slate-300', 'bg-blue-500', 'bg-purple-500', 'bg-emerald-500'];
+                        return (
+                          <div className="flex items-end gap-1 h-8">
+                            {stages.map((v, i) => (
+                              <div
+                                key={i}
+                                className={`w-4 rounded-t ${colors[i]}`}
+                                style={{ height: `${Math.max((v / max) * 100, 6)}%` }}
+                                title={`${['Applied', 'Shortlisted', 'Interviewed', 'Offers'][i]}: ${v}`}
+                              />
+                            ))}
+                          </div>
+                        );
+                      })()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {funnelTrend.length > 0 && (
+            <div className="pt-4 border-t border-slate-100">
+              <p className="text-xs font-bold text-slate-600 flex items-center gap-1.5 mb-3">
+                <TrendingUp className="w-3.5 h-3.5 text-violet-600" />
+                Weekly Applications Trend
+              </p>
+              <div className="flex items-end gap-3 h-28 overflow-x-auto pb-1">
+                {(() => {
+                  const max = Math.max(...funnelTrend.map(w => w.applications), 1);
+                  return funnelTrend.map(w => (
+                    <div key={w.week} className="flex flex-col items-center gap-1 min-w-12">
+                      <span className="text-[10px] font-bold text-slate-700">{w.applications}</span>
+                      <div
+                        className="w-8 rounded-t-lg bg-gradient-to-t from-violet-500 to-violet-300"
+                        style={{ height: `${Math.max((w.applications / max) * 80, 6)}px` }}
+                        title={`Week of ${w.week}`}
+                      />
+                      <span className="text-[9px] text-slate-400 whitespace-nowrap">{w.week}</span>
+                    </div>
+                  ));
+                })()}
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         /* CONDITIONAL VIEW: RECRUITMENT HUB & ATS */
@@ -587,7 +759,7 @@ export const IndustryDashboard: React.FC = () => {
                     Shortlist
                   </button>
                   <button
-                    onClick={() => runBulk('Interview Scheduled')}
+                    onClick={() => openScheduleForm()}
                     disabled={selectedCandidateIds.size === 0 || isBulkWorking}
                     className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 text-white rounded-lg font-bold text-[11px]"
                   >
@@ -601,6 +773,91 @@ export const IndustryDashboard: React.FC = () => {
                     Reject
                   </button>
                 </div>
+
+                {showScheduleForm && (
+                  <form onSubmit={runSchedule} className="p-4 rounded-xl bg-purple-50 border border-purple-200 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-bold text-purple-800 flex items-center gap-1.5">
+                        <Calendar className="w-3.5 h-3.5" />
+                        Book Interview Slot — {selectedCandidateIds.size} candidate(s)
+                      </h3>
+                      <button type="button" onClick={() => setShowScheduleForm(false)} className="text-[11px] font-bold text-purple-500 hover:text-purple-800">✕</button>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-1">Date &amp; Time *</label>
+                        <input
+                          type="datetime-local"
+                          required
+                          value={schedAt}
+                          onChange={(e) => setSchedAt(e.target.value)}
+                          className="w-full px-2.5 py-2 rounded-lg border border-purple-200 bg-white text-[11px] focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-1">Duration (min)</label>
+                        <select value={schedDuration} onChange={(e) => setSchedDuration(e.target.value)} className="w-full px-2.5 py-2 rounded-lg border border-purple-200 bg-white text-[11px] focus:outline-none focus:ring-2 focus:ring-purple-500">
+                          {['30', '45', '60', '90'].map(d => <option key={d} value={d}>{d}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-1">Mode</label>
+                        <select value={schedMode} onChange={(e) => setSchedMode(e.target.value as 'online' | 'in-person' | 'phone')} className="w-full px-2.5 py-2 rounded-lg border border-purple-200 bg-white text-[11px] focus:outline-none focus:ring-2 focus:ring-purple-500">
+                          <option value="online">Online</option>
+                          <option value="in-person">In-person</option>
+                          <option value="phone">Phone</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-slate-600 mb-1">Meeting URL</label>
+                        <input
+                          type="url"
+                          placeholder="https://meet…"
+                          value={schedUrl}
+                          onChange={(e) => setSchedUrl(e.target.value)}
+                          className="w-full px-2.5 py-2 rounded-lg border border-purple-200 bg-white text-[11px] focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                      </div>
+                    </div>
+                    <input
+                      type="text"
+                      placeholder="Notes for the candidate (optional)"
+                      value={schedNotes}
+                      onChange={(e) => setSchedNotes(e.target.value)}
+                      className="w-full px-2.5 py-2 rounded-lg border border-purple-200 bg-white text-[11px] focus:outline-none focus:ring-2 focus:ring-purple-500"
+                    />
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="submit"
+                        disabled={selectedCandidateIds.size === 0 || isBulkWorking || !schedAt}
+                        className="px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 text-white rounded-lg font-bold text-[11px]"
+                      >
+                        {isBulkWorking ? 'Booking…' : `Book for ${selectedCandidateIds.size} candidate(s)`}
+                      </button>
+                      <span className="text-[10px] text-slate-500">Students get a notification with the slot details instantly.</span>
+                    </div>
+                    {jobSlots.length > 0 && (
+                      <div className="pt-2 border-t border-purple-100">
+                        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Booked slots ({jobSlots.length})</p>
+                        <div className="space-y-1 max-h-32 overflow-y-auto">
+                          {jobSlots.map(s => (
+                            <div key={s.id} className="flex items-center gap-2 text-[11px] text-slate-600 flex-wrap">
+                              <Clock className="w-3 h-3 text-purple-500" />
+                              <span className="font-semibold">{s.studentName || s.studentId}</span>
+                              <span>• {new Date(s.scheduledAt).toLocaleString()}</span>
+                              <span>• {s.mode}</span>
+                              <span className={`ml-auto px-1.5 py-0.5 rounded font-bold text-[9px] ${
+                                s.status === 'scheduled' ? 'bg-emerald-100 text-emerald-700'
+                                : s.status === 'completed' ? 'bg-blue-100 text-blue-700'
+                                : 'bg-slate-200 text-slate-600'
+                              }`}>{s.status}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </form>
+                )}
 
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">

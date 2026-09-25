@@ -1214,6 +1214,187 @@ router.patch('/applications/bulk-status', requireAuth, async (req: Request, res:
 // ==========================================
 // 6. APPLICATIONS & ATS WORKFLOW
 // ==========================================
+// ── Interview slot scheduling (owner-only): book real slots for selected candidates ──
+router.post('/applications/schedule-interviews', requireAuth, async (req: Request, res: Response) => {
+  const { ids, scheduledAt, durationMinutes, mode, meetingUrl, notes } = req.body || {};
+  const targetIds: string[] = Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+
+  if (targetIds.length === 0) {
+    return res.status(400).json({ error: 'Provide application ids[] to schedule interviews for.' });
+  }
+  const when = new Date(String(scheduledAt || ''));
+  if (!scheduledAt || isNaN(when.getTime()) || when.getTime() < Date.now() - 60_000) {
+    return res.status(400).json({ error: 'scheduledAt must be a valid future date/time (ISO string).' });
+  }
+  const duration = Math.min(Math.max(Number(durationMinutes) || 45, 10), 240);
+  const interviewMode = ['online', 'in-person', 'phone'].includes(mode) ? mode : 'online';
+
+  try {
+    const recruiter = (req as any).user;
+    // Ownership enforced in SQL: only applications on jobs posted_by the caller can be booked.
+    const apps = await query(
+      `SELECT a.id, a.student_id, a.student_name, a.job_id, a.job_title, a.company
+         FROM applications a
+        WHERE a.id = ANY($1::text[])
+          AND a.job_id IN (SELECT id FROM jobs WHERE posted_by = $2)`,
+      [targetIds, recruiter.sub]
+    );
+    if (apps.rows.length === 0) {
+      return res.status(403).json({ error: 'No schedulable applications found among the selected candidates.' });
+    }
+
+    const slotRows: any[] = [];
+    for (const app of apps.rows) {
+      const slotId = `slot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      await query(
+        `INSERT INTO interview_slots (id, application_id, job_id, student_id, scheduled_at, duration_minutes, mode, meeting_url, notes, status, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'scheduled', $10)`,
+        [slotId, app.id, app.job_id, app.student_id, when.toISOString(), duration, interviewMode, meetingUrl || null, notes || null, recruiter.sub]
+      );
+      const whenLabel = when.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+      slotRows.push({ id: slotId, applicationId: app.id, jobId: app.job_id, studentId: app.student_id, studentName: app.student_name, scheduledAt: when.toISOString(), durationMinutes: duration, mode: interviewMode, meetingUrl: meetingUrl || null, notes: notes || null, status: 'scheduled' });
+
+      await query(
+        `UPDATE applications a
+            SET status = 'Interview Scheduled',
+                updated_at = CURRENT_TIMESTAMP,
+                stage_history = a.stage_history || $2::jsonb
+          WHERE a.id = $1`,
+        [app.id, JSON.stringify([{ stage: 'Interview Scheduled', date: new Date().toISOString().split('T')[0], note: `Interview booked for ${whenLabel} (${interviewMode})` }])]
+      );
+
+      const uidRes = await query(
+        `SELECT u.id FROM users u WHERE LOWER(u.email) = (SELECT LOWER(email) FROM students WHERE id = $1)`,
+        [app.student_id]
+      ).catch(() => ({ rows: [] as any[] }));
+      const uid = uidRes.rows[0]?.id || app.student_id;
+      await query(
+        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
+        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, 'Interview Scheduled', `Your interview for ${app.job_title} at ${app.company} is booked for ${whenLabel} (${interviewMode}).`, 'success']
+      ).catch(() => {});
+      emitEvent({
+        type: 'application_update',
+        title: 'Interview Scheduled',
+        message: `Your interview for ${app.job_title} at ${app.company} is booked for ${whenLabel} (${interviewMode}).`,
+        targetUserId: uid,
+        data: { applicationId: app.id, jobId: app.job_id, scheduledAt: when.toISOString(), mode: interviewMode },
+      });
+    }
+
+    res.status(201).json({ success: true, scheduled: slotRows.length, slots: slotRows });
+  } catch (error: any) {
+    console.error('schedule-interviews failed:', error.message);
+    res.status(500).json({ error: 'Failed to schedule interviews.' });
+  }
+});
+
+// ── Interview slots for one job (owner-only) ──
+router.get('/jobs/:jobId/interview-slots', requireAuth, async (req: Request, res: Response) => {
+  const job = await requireJobOwner(req, res);
+  if (!job) return;
+  try {
+    const result = await query(
+      `SELECT s.*, a.student_name AS app_student_name
+         FROM interview_slots s
+         JOIN applications a ON a.id = s.application_id
+        WHERE s.job_id = $1
+        ORDER BY s.scheduled_at ASC`,
+      [job.id]
+    );
+    const slots = result.rows.map(r => ({
+      id: r.id,
+      applicationId: r.application_id,
+      jobId: r.job_id,
+      studentId: r.student_id,
+      studentName: r.student_name || r.app_student_name,
+      scheduledAt: r.scheduled_at,
+      durationMinutes: r.duration_minutes,
+      mode: r.mode,
+      meetingUrl: r.meeting_url,
+      notes: r.notes,
+      status: r.status,
+      createdAt: r.created_at,
+    }));
+    res.json({ success: true, slots });
+  } catch (error: any) {
+    console.error('interview-slots failed:', error.message);
+    res.status(500).json({ error: 'Failed to load interview slots.' });
+  }
+});
+
+// ── Update a slot (owner-only): mark completed / cancel ──
+router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: Response) => {
+  const { status } = req.body || {};
+  if (!['completed', 'cancelled'].includes(status)) {
+    return res.status(400).json({ error: "status must be 'completed' or 'cancelled'." });
+  }
+  try {
+    const recruiter = (req as any).user;
+    const result = await query(
+      `UPDATE interview_slots s SET status = $1
+        WHERE s.id = $2 AND s.job_id IN (SELECT id FROM jobs WHERE posted_by = $3)
+        RETURNING *`,
+      [status, req.params.slotId, recruiter.sub]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Slot not found (or you do not own its job).' });
+    }
+    res.json({ success: true, slot: { id: result.rows[0].id, status: result.rows[0].status } });
+  } catch (error: any) {
+    console.error('interview-slot update failed:', error.message);
+    res.status(500).json({ error: 'Failed to update interview slot.' });
+  }
+});
+
+// ── Recruiter funnel analytics: applied → shortlisted → interview → offer per posting ──
+router.get('/recruiter/funnel', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const recruiter = (req as any).user;
+    const perJob = await query(
+      `SELECT j.id AS job_id, j.title, j.company,
+              count(a.id) AS applied,
+              count(a.id) FILTER (WHERE a.status IN ('Shortlisted','Interview Scheduled','Offer Extended')) AS shortlisted,
+              count(a.id) FILTER (WHERE a.status IN ('Interview Scheduled','Offer Extended')) AS interviewed,
+              count(a.id) FILTER (WHERE a.status = 'Offer Extended') AS offers,
+              count(a.id) FILTER (WHERE a.status = 'Rejected') AS rejected
+         FROM jobs j
+         LEFT JOIN applications a ON a.job_id = j.id
+        WHERE j.posted_by = $1
+        GROUP BY j.id, j.title, j.company
+        ORDER BY applied DESC, j.title ASC`,
+      [recruiter.sub]
+    );
+    const trend = await query(
+      `SELECT to_char(date_trunc('week', a.applied_date), 'YYYY-MM-DD') AS week, count(*)::int AS applications
+         FROM applications a
+         JOIN jobs j ON j.id = a.job_id
+        WHERE j.posted_by = $1
+        GROUP BY 1
+        ORDER BY 1 ASC`,
+      [recruiter.sub]
+    );
+    const postings = perJob.rows.map(r => {
+      const applied = Number(r.applied) || 0;
+      const offers = Number(r.offers) || 0;
+      return {
+        jobId: r.job_id,
+        title: r.title,
+        company: r.company,
+        applied,
+        shortlisted: Number(r.shortlisted) || 0,
+        interviewed: Number(r.interviewed) || 0,
+        offers,
+        rejected: Number(r.rejected) || 0,
+        conversionPct: applied > 0 ? Math.round((offers / applied) * 1000) / 10 : 0,
+      };
+    });
+    res.json({ success: true, postings, weeklyTrend: trend.rows.map(r => ({ week: r.week, applications: Number(r.applications) })) });
+  } catch (error: any) {
+    console.error('recruiter funnel failed:', error.message);
+    res.status(500).json({ error: 'Failed to compute funnel analytics.' });
+  }
+});
+
 router.get('/applications', async (req: Request, res: Response) => {
   try {
     // ?studentId= scopes to one student (personal tracker).
