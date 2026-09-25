@@ -75,8 +75,8 @@ router.post('/assessment/generate', async (req: Request, res: Response) => {
     });
 
     if (!response.ok) throw new Error('Gemini API call failed');
-    const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const data: any = await response.json();
+    const rawText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     
     if (!rawText) throw new Error('Empty response from Gemini');
     
@@ -3256,13 +3256,13 @@ router.get('/verify/institution-status', requireAuth, async (req: Request, res: 
     res.json({
       success: true,
       verificationStatus: row.verification_status || 'pending',
-      statusLabel: {
+      statusLabel: ({
         verified: 'Verified',
         pending_college_approval: 'Pending college approval',
         pending_admin_approval: 'Pending platform admin approval',
         rejected: 'Verification rejected',
         pending: 'Verification pending',
-      }[row.verification_status || 'pending'] || 'Verification pending',
+      } as Record<string, string>)[row.verification_status || 'pending'] || 'Verification pending',
       institution,
       industry,
     });
