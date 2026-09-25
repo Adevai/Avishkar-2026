@@ -95,7 +95,7 @@ export const Sidebar: React.FC = () => {
             {currentRole === 'student' && 'Smart Career Roadmap'}
             {currentRole === 'college' && 'Academia Governance'}
             {currentRole === 'industry' && 'Talent & Innovation'}
-            {currentRole === 'government' && 'Policy & Skill Oversight'}
+            {currentRole === 'government' && 'Policy & Macro-Analytics View'}
             {currentRole === 'alumni' && 'Verified Mentor Network'}
           </p>
         </div>

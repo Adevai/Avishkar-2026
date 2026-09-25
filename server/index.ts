@@ -11,9 +11,11 @@ import { seedAlumniActivity } from './alumniActivitySeed';
 import { startJobSyncScheduler } from './jobSync';
 import { startJobAlertScheduler } from './jobAlerts';
 import { startInterviewReminderScheduler } from './jobAlerts';
+import { startOutboxWorker } from './emailOutbox';
 import { startHeartbeat, connectedClients } from './events';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -68,6 +70,23 @@ app.use((req, res, next) => {
 
 // ── Body limits & logging (silenced under test) ─────────────────────────────
 app.use(express.json({ limit: '10mb' }));
+
+// Request-ID + counters: every log line can be traced, and /metrics exposes
+// liveness/traffic data for uptime monitors without external deps.
+const metrics = { requests: 0, errors: 0, startedAt: Date.now() };
+app.use((req, res, next) => {
+  const requestId = (req.headers['x-request-id'] as string) || crypto.randomUUID();
+  (req as any).requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  metrics.requests += 1;
+  const originalJson = res.json.bind(res);
+  res.json = (body: any) => {
+    if (res.statusCode >= 500) metrics.errors += 1;
+    return originalJson(body);
+  };
+  next();
+});
+
 if (process.env.NODE_ENV !== 'test') {
   app.use(morgan(NODE_ENV === 'production' ? 'combined' : 'dev'));
 }
@@ -149,6 +168,23 @@ if (fs.existsSync(distDir)) {
   });
 }
 
+// ── Metrics for uptime monitoring (no external deps) ───────────────────────
+app.get('/api/metrics', (req, res) => {
+  const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+  res.json({
+    status: 'ok',
+    uptimeSeconds: uptimeS,
+    requestsTotal: metrics.requests,
+    errors5xx: metrics.errors,
+    memory: {
+      rssMb: Math.round(process.memoryUsage().rss / 1048576),
+      heapMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    },
+    nodeVersion: process.version,
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // 404 handler for unknown API routes
 app.use((req, res) => {
   res.status(404).json({ error: `Route not found: ${req.method} ${req.originalUrl}` });
@@ -191,22 +227,30 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 async function startServer() {
   try {
     await initDatabase();
-    await seedDatabase();
 
-    // Optional: bulk realistic dataset (SEED_LARGE_DATASET=true)
-    await generateLargeSeed().catch(err =>
-      console.warn('⚠️  Large seed skipped:', err.message)
-    );
+    // Demo/sample data is opt-in outside development: production boots with
+    // an empty database unless the operator explicitly sets SEED_DEMO=true.
+    const seedingAllowed = NODE_ENV !== 'production' || process.env.SEED_DEMO === 'true';
+    if (!seedingAllowed) {
+      console.log('[seed] Skipped in production (set SEED_DEMO=true to allow demo data).');
+    } else {
+      await seedDatabase();
 
-    // Verified alumni mentor network (idempotent — skips when populated)
-    await seedAlumniNetwork().catch(err =>
-      console.warn('⚠️  Alumni seed skipped:', err.message)
-    );
+      // Optional: bulk realistic dataset (SEED_LARGE_DATASET=true)
+      await generateLargeSeed().catch(err =>
+        console.warn('⚠️  Large seed skipped:', err.message)
+      );
 
-    // Demo mentorship room, chat history & fast-track opportunity (idempotent)
-    await seedAlumniActivity().catch(err =>
-      console.warn('⚠️  Alumni activity seed skipped:', err.message)
-    );
+      // Verified alumni mentor network (idempotent — skips when populated)
+      await seedAlumniNetwork().catch(err =>
+        console.warn('⚠️  Alumni seed skipped:', err.message)
+      );
+
+      // Demo mentorship room, chat history & fast-track opportunity (idempotent)
+      await seedAlumniActivity().catch(err =>
+        console.warn('⚠️  Alumni activity seed skipped:', err.message)
+      );
+    }
 
     server = app.listen(PORT, () => {
       console.log(`⚡ S.P.A.R.K. PostgreSQL Backend running on http://localhost:${PORT} [${NODE_ENV}]`);
@@ -220,6 +264,7 @@ async function startServer() {
     startJobSyncScheduler();
     startJobAlertScheduler();
     startInterviewReminderScheduler();
+    startOutboxWorker();
 
     // SSE keepalive pings every 30s so proxies keep event streams open
     startHeartbeat();

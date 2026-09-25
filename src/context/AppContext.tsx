@@ -19,7 +19,7 @@ import {
   ASSESSMENT_QUESTIONS,
 } from '../data/mockData';
 import { calculateJobMatch } from '../utils/matchCalculator';
-import { api, BackendHealth } from '../services/api';
+import { api, API_BASE, BackendHealth } from '../services/api';
 
 interface AppContextType {
   currentRole: UserRole;
@@ -33,7 +33,7 @@ interface AppContextType {
   parseResumeWithAI: (file?: File) => Promise<{ extracted: { skill: string; confidence: number; category?: string }[]; fileName?: string; summaryText?: string } | undefined>;
   registerAccount: (data: any) => Promise<void>;
   assessmentResult: AssessmentResult | null;
-  submitAssessment: (answers: Record<string, number>, timeSpent: number, questionsList?: AssessmentQuestion[]) => Promise<void>;
+  submitAssessment: (assessmentId: string, answers: Record<string, number>, timeSpent: number) => Promise<void>;
   roadmap: RoadmapMilestone[];
   toggleModuleComplete: (milestoneId: string, moduleId: string) => Promise<void>;
   verifyAndCompleteModule: (milestoneId: string, moduleId: string, score: number) => Promise<void>;
@@ -524,74 +524,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const submitAssessment = async (answers: Record<string, number>, timeSpent: number, questionsList?: AssessmentQuestion[]) => {
-    const activeQuestions = (questionsList && questionsList.length > 0) ? questionsList : ASSESSMENT_QUESTIONS;
-    let correct = 0;
-    const catTotal: Record<string, number> = {};
-    const catCorrect: Record<string, number> = {};
-
-    activeQuestions.forEach(q => {
-      catTotal[q.category] = (catTotal[q.category] || 0) + 1;
-      if (answers[q.id] === q.correctAnswer) {
-        correct++;
-        catCorrect[q.category] = (catCorrect[q.category] || 0) + 1;
-      }
-    });
-
-    const categoryScores: Record<string, number> = {};
-    Object.keys(catTotal).forEach(cat => {
-      const c = catCorrect[cat] || 0;
-      const t = catTotal[cat] || 1;
-      categoryScores[cat] = Math.round((c / t) * 100);
-    });
-
-    const totalQuestions = activeQuestions.length;
-    const percentage = Math.round((correct / totalQuestions) * 100);
-
-    let performanceGrade: AssessmentResult['performanceGrade'] = 'Foundational';
-    if (percentage >= 85) performanceGrade = 'Elite (Ready for Top Tier)';
-    else if (percentage >= 70) performanceGrade = 'Proficient';
-    else if (percentage >= 50) performanceGrade = 'Needs Bridging';
-
-    const result: AssessmentResult = {
-      completedAt: new Date().toLocaleString(),
-      totalScore: correct,
-      maxScore: totalQuestions,
-      percentage,
-      categoryScores,
-      timeSpentSeconds: timeSpent,
-      performanceGrade,
-    };
-
-    setAssessmentResult(result);
-
-    const updatedVerified = [...student.verifiedSkills];
-    if (categoryScores['cloud_devops']) {
-      const idx = updatedVerified.findIndex(v => v.skill === 'Cloud & Docker');
-      if (idx >= 0) updatedVerified[idx].score = Math.max(updatedVerified[idx].score, categoryScores['cloud_devops']);
-    }
-    if (categoryScores['fundamentals']) {
-      const idx = updatedVerified.findIndex(v => v.skill === 'Data Structures & Algorithms');
-      if (idx >= 0) updatedVerified[idx].score = Math.max(updatedVerified[idx].score, categoryScores['fundamentals']);
-    }
-
-    const newReadiness = Math.round((student.readinessScore + percentage) / 2);
-    setStudent(prev => ({
-      ...prev,
-      assessmentCompleted: true,
-      readinessScore: newReadiness,
-      verifiedSkills: updatedVerified,
-    }));
-
-    // Unlock assessment navigation
-    setIsAssessmentActive(false);
+  const submitAssessment = async (assessmentId: string, answers: Record<string, number>, timeSpent: number) => {
     try {
-      localStorage.removeItem('spark_assessment_locked');
-      localStorage.removeItem('spark_active_assessment_v1');
-    } catch (e) {}
+      const res = await fetch(`${API_BASE}/assessment/grade`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ assessmentId, answers, timeSpentSeconds: timeSpent, studentId: student?.id })
+      });
+      if (!res.ok) throw new Error('Grading failed');
+      const data = await res.json();
+      const result = data.result;
 
-    setActiveTabState('gap-analysis');
-    setNotification('AI Skill Assessment Completed! Viewing Skill Gap Analysis.');
+      setAssessmentResult(result);
+      setIsAssessmentActive(false);
+
+      try {
+        localStorage.removeItem('spark_assessment_locked');
+        localStorage.removeItem('spark_active_assessment_v1');
+      } catch (e) {}
+
+      setActiveTabState('gap-analysis');
+      setNotification('AI Skill Assessment Completed! Viewing Skill Gap Analysis.');
+    } catch (e) {
+      console.error(e);
+      setNotification('Failed to grade assessment. Please try again.');
+    }
   };
 
   const toggleModuleComplete = async (milestoneId: string, moduleId: string) => {

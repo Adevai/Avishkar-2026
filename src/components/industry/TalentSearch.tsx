@@ -68,8 +68,20 @@ export const TalentSearch: React.FC = () => {
     return true;
   });
 
-  const handleSendInvite = (studentName: string) => {
-    setNotification(`Direct Interview Invitation sent to ${studentName}!`);
+  const [invitingId, setInvitingId] = useState<string | null>(null);
+
+  // Real invitation: persisted server-side, student gets a notification + SSE.
+  const handleSendInvite = async (candidate: StudentProfile) => {
+    if (invitingId) return;
+    setInvitingId(candidate.id);
+    try {
+      const r = await api.inviteTalent(candidate.id, 'Interview invitation from AI Talent Search');
+      setNotification(`Interview invitation sent to ${r.studentName} — they've been notified.`);
+    } catch (e: any) {
+      setNotification(e?.message || 'Failed to send the invitation.');
+    } finally {
+      setInvitingId(null);
+    }
   };
 
   return (
@@ -242,11 +254,12 @@ export const TalentSearch: React.FC = () => {
                 Resume: {candidate.resumeUploaded ? 'Verified PDF' : 'Not Provided'}
               </span>
               <button
-                onClick={() => handleSendInvite(candidate.name)}
-                className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold shadow-sm transition-all hover:scale-105"
+                onClick={() => handleSendInvite(candidate)}
+                disabled={invitingId === candidate.id}
+                className="flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold shadow-sm transition-all hover:scale-105"
               >
                 <Send className="w-3.5 h-3.5" />
-                <span>Send Interview Invite</span>
+                <span>{invitingId === candidate.id ? 'Sending…' : 'Send Interview Invite'}</span>
               </button>
             </div>
           </div>

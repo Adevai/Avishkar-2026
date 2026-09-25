@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
 import { COLLEGE_DEPARTMENT_STATS } from '../../data/mockData';
+import { api } from '../../services/api';
 import {
   Building2,
   Users,
@@ -36,6 +37,15 @@ import {
 export const CollegeDashboard: React.FC = () => {
   const { mous, activeTab, setActiveTab, setNotification } = useApp();
   const [driveFilter, setDriveFilter] = useState<'all' | 'ongoing' | 'upcoming'>('all');
+  const [stats, setStats] = useState<any[]>(COLLEGE_DEPARTMENT_STATS);
+
+  useEffect(() => {
+    api.getAnalytics().then(res => {
+      if (res.collegeDepartmentStats && res.collegeDepartmentStats.length > 0) {
+        setStats(res.collegeDepartmentStats);
+      }
+    }).catch(console.error);
+  }, []);
 
   const handleExportReport = () => {
     setNotification('Generated Batch Placement & Skill Readiness Report (CSV / PDF)!');
@@ -235,7 +245,7 @@ export const CollegeDashboard: React.FC = () => {
 
             <div className="h-72 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={COLLEGE_DEPARTMENT_STATS} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
+                <BarChart data={stats} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                   <XAxis dataKey="department" tick={{ fontSize: 10, fill: '#64748b' }} interval={0} />
                   <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#64748b' }} unit="%" />
@@ -303,7 +313,7 @@ export const CollegeDashboard: React.FC = () => {
                 </button>
               </div>
               <div className="space-y-3 text-xs">
-                {COLLEGE_DEPARTMENT_STATS.slice(0, 3).map((dept, idx) => (
+                {stats.slice(0, 3).map((dept, idx) => (
                   <div key={idx} className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 flex items-center justify-between">
                     <div>
                       <p className="font-bold text-slate-900">{dept.department}</p>
@@ -362,7 +372,7 @@ export const CollegeDashboard: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {COLLEGE_DEPARTMENT_STATS.map((dept, idx) => (
+                  {stats.map((dept, idx) => (
                     <tr key={idx} className="hover:bg-slate-50/80 transition-colors">
                       <td className="py-3.5 font-bold text-slate-800">{dept.department}</td>
                       <td className="py-3.5 text-center text-slate-600">{dept.totalStudents}</td>
@@ -402,7 +412,7 @@ export const CollegeDashboard: React.FC = () => {
             </h2>
             <div className="h-72 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={COLLEGE_DEPARTMENT_STATS} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
+                <BarChart data={stats} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                   <XAxis dataKey="department" tick={{ fontSize: 10, fill: '#64748b' }} interval={0} />
                   <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#64748b' }} unit="%" />

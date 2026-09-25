@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { Navbar } from '../components/layout/Navbar';
 import { Sidebar } from '../components/layout/Sidebar';
 import { Footer } from '../components/layout/Footer';
@@ -9,25 +9,41 @@ import { NotificationsDrawer } from '../components/common/NotificationsDrawer';
 import { SkillSimulatorModal } from '../components/student/SkillSimulatorModal';
 import { AICopilotModal } from '../components/ai/AICopilotModal';
 
+// Default-view stays eager (first paint); everything else is code-split so
+// the Dashboard chunk stops carrying the whole app (was 600+ kB).
 import { StudentProfile } from '../components/student/StudentProfile';
-import { AIAssessment } from '../components/student/AIAssessment';
-import { SkillGapReport } from '../components/student/SkillGapReport';
-import { LearningRoadmap } from '../components/student/LearningRoadmap';
-import { JobMatches } from '../components/student/JobMatches';
-import { PlacementTracker } from '../components/student/PlacementTracker';
-import { ProgressAnalytics } from '../components/student/ProgressAnalytics';
-import { CollegeDashboard } from '../components/college/CollegeDashboard';
-import { CollegeStudentDirectory } from '../components/college/CollegeStudentDirectory';
-import { MoUManager } from '../components/collaboration/MoUManager';
-import { IndustryDashboard } from '../components/industry/IndustryDashboard';
-import { TalentSearch } from '../components/industry/TalentSearch';
-import { ProblemStatements } from '../components/collaboration/ProblemStatements';
-import { GovtDashboard } from '../components/government/GovtDashboard';
-import { VerificationQueue } from '../components/government/VerificationQueue';
-import { WelcomeIntakeModal } from '../components/student/WelcomeIntakeModal';
-import { MentorDashboard } from '../components/alumni/MentorDashboard';
-import { StudentMentorship } from '../components/alumni/StudentMentorship';
-import { UniversityAlumniVerificationDesk } from '../components/alumni/UniversityAlumniVerificationDesk';
+
+const AIAssessment = lazy(() => import('../components/student/AIAssessment').then(m => ({ default: m.AIAssessment })));
+const SkillGapReport = lazy(() => import('../components/student/SkillGapReport').then(m => ({ default: m.SkillGapReport })));
+const LearningRoadmap = lazy(() => import('../components/student/LearningRoadmap').then(m => ({ default: m.LearningRoadmap })));
+const JobMatches = lazy(() => import('../components/student/JobMatches').then(m => ({ default: m.JobMatches })));
+const PlacementTracker = lazy(() => import('../components/student/PlacementTracker').then(m => ({ default: m.PlacementTracker })));
+const ProgressAnalytics = lazy(() => import('../components/student/ProgressAnalytics').then(m => ({ default: m.ProgressAnalytics })));
+const CollegeDashboard = lazy(() => import('../components/college/CollegeDashboard').then(m => ({ default: m.CollegeDashboard })));
+const CollegeStudentDirectory = lazy(() => import('../components/college/CollegeStudentDirectory').then(m => ({ default: m.CollegeStudentDirectory })));
+const MoUManager = lazy(() => import('../components/collaboration/MoUManager').then(m => ({ default: m.MoUManager })));
+const IndustryDashboard = lazy(() => import('../components/industry/IndustryDashboard').then(m => ({ default: m.IndustryDashboard })));
+const TalentSearch = lazy(() => import('../components/industry/TalentSearch').then(m => ({ default: m.TalentSearch })));
+const ProblemStatements = lazy(() => import('../components/collaboration/ProblemStatements').then(m => ({ default: m.ProblemStatements })));
+const GovtDashboard = lazy(() => import('../components/government/GovtDashboard').then(m => ({ default: m.GovtDashboard })));
+const VerificationQueue = lazy(() => import('../components/government/VerificationQueue').then(m => ({ default: m.VerificationQueue })));
+const WelcomeIntakeModal = lazy(() => import('../components/student/WelcomeIntakeModal').then(m => ({ default: m.WelcomeIntakeModal })));
+const MentorDashboard = lazy(() => import('../components/alumni/MentorDashboard').then(m => ({ default: m.MentorDashboard })));
+const StudentMentorship = lazy(() => import('../components/alumni/StudentMentorship').then(m => ({ default: m.StudentMentorship })));
+const UniversityAlumniVerificationDesk = lazy(() => import('../components/alumni/UniversityAlumniVerificationDesk').then(m => ({ default: m.UniversityAlumniVerificationDesk })));
+
+const TabSuspense: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <Suspense fallback={
+    <div className="min-h-[40vh] flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+        <p className="text-xs font-bold text-slate-500">Loading module…</p>
+      </div>
+    </div>
+  }>
+    {children}
+  </Suspense>
+);
 
 import { useApp } from '../context/AppContext';
 import { useSparkEvents } from '../hooks/useSparkEvents';
@@ -156,10 +172,10 @@ export const Dashboard: React.FC = () => {
             </div>
           )}
 
-          {/* Dynamic Component Views */}
+          {/* Dynamic Component Views (code-split via TabSuspense) */}
           <div className="animate-in slide-in-from-bottom-2 fade-in duration-500">
             {currentRole === 'student' && (
-              <>
+              <TabSuspense>
                 {(activeTab === 'profile' || !['assessment', 'gap-analysis', 'roadmap', 'jobs', 'applications', 'analytics', 'collaboration', 'mentorship'].includes(activeTab)) && <StudentProfile />}
                 {activeTab === 'assessment' && <AIAssessment />}
                 {activeTab === 'gap-analysis' && <SkillGapReport />}
@@ -169,34 +185,38 @@ export const Dashboard: React.FC = () => {
                 {activeTab === 'analytics' && <ProgressAnalytics />}
                 {activeTab === 'collaboration' && <ProblemStatements />}
                 {activeTab === 'mentorship' && <StudentMentorship />}
-              </>
+              </TabSuspense>
             )}
 
             {currentRole === 'college' && (
-              <>
+              <TabSuspense>
                 {(activeTab === 'overview' || activeTab === 'dept-analysis' || activeTab === 'placement-drives' || !['students', 'mous', 'alumni-desk'].includes(activeTab)) && <CollegeDashboard />}
                 {activeTab === 'students' && <CollegeStudentDirectory />}
                 {activeTab === 'mous' && <MoUManager />}
                 {activeTab === 'alumni-desk' && <UniversityAlumniVerificationDesk />}
-              </>
+              </TabSuspense>
             )}
 
             {currentRole === 'industry' && (
-              <>
+              <TabSuspense>
                 {(activeTab === 'dashboard' || activeTab === 'post-job' || !['talent-search', 'problem-statements', 'mous'].includes(activeTab)) && <IndustryDashboard />}
                 {activeTab === 'talent-search' && <TalentSearch />}
                 {activeTab === 'problem-statements' && <ProblemStatements />}
                 {activeTab === 'mous' && <MoUManager />}
-              </>
+              </TabSuspense>
             )}
 
             {currentRole === 'government' && (
-              <>
+              <TabSuspense>
                 {activeTab === 'verification-queue' ? <VerificationQueue /> : <GovtDashboard />}
-              </>
+              </TabSuspense>
             )}
 
-            {currentRole === 'alumni' && <MentorDashboard initialSection={activeTab} />}
+            {currentRole === 'alumni' && (
+              <TabSuspense>
+                <MentorDashboard initialSection={activeTab} />
+              </TabSuspense>
+            )}
           </div>
         </main>
       </div>

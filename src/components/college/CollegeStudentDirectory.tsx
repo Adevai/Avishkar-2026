@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { api } from '../../services/api';
+import { api, API_BASE } from '../../services/api';
+import { authFetch } from '../../services/api';
 import { StudentProfile } from '../../types';
 import { 
   Users, 
@@ -91,7 +92,23 @@ export const CollegeStudentDirectory: React.FC = () => {
 
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setNotification('Exporting Student Skill Registry as Excel (NIRF Audit format)...')}
+            onClick={async () => {
+              try {
+                const res = await authFetch(`${API_BASE}/college/nirf-export`);
+                if (!res.ok) throw new Error('Export failed');
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `nirf-student-registry-${new Date().toISOString().slice(0, 10)}.csv`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+              } catch (e: any) {
+                setNotification(e?.message || 'Export failed.');
+              }
+            }}
             className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-colors"
           >
             Export NIRF Excel

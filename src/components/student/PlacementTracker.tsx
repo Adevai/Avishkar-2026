@@ -25,6 +25,9 @@ export const PlacementTracker: React.FC = () => {
   const { applications, student, setActiveTab, setNotification } = useApp();
   const [slots, setSlots] = useState<InterviewSlot[]>([]);
   const [slotsLoaded, setSlotsLoaded] = useState(false);
+  const [offers, setOffers] = useState<{ id: string; status: string; salaryText?: string; joiningDate?: string; deadline: string; jobTitle: string; company: string }[]>([]);
+  const [offerBusyId, setOfferBusyId] = useState<string | null>(null);
+  const [calUrl, setCalUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -32,8 +35,29 @@ export const PlacementTracker: React.FC = () => {
       .then(res => { if (!cancelled) setSlots(res.slots || []); })
       .catch(err => console.warn('Failed to load interview slots:', err?.message))
       .finally(() => { if (!cancelled) setSlotsLoaded(true); });
+    api.getMyOffers()
+      .then(res => { if (!cancelled) setOffers(res.offers || []); })
+      .catch(() => {});
+    api.getCalendarFeed()
+      .then(res => { if (!cancelled) setCalUrl(res.url); })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
+
+  const respondOffer = async (offerId: string, decision: 'accepted' | 'declined') => {
+    if (offerBusyId) return;
+    setOfferBusyId(offerId);
+    try {
+      await api.respondToOffer(offerId, decision);
+      setNotification(decision === 'accepted' ? '🎉 Offer accepted — the recruiter has been notified.' : 'Offer declined — the recruiter has been notified.');
+      const res = await api.getMyOffers();
+      setOffers(res.offers || []);
+    } catch (e: any) {
+      setNotification(e?.message || 'Failed to respond to the offer.');
+    } finally {
+      setOfferBusyId(null);
+    }
+  };
 
   const now = Date.now();
   const upcoming = slots
@@ -185,6 +209,16 @@ export const PlacementTracker: React.FC = () => {
                     </span>
                   </div>
                   <div className="flex items-center gap-2 flex-wrap">
+                    {calUrl && (
+                      <a
+                        href={calUrl}
+                        title="Subscribe from any calendar app — auto-syncs all your interviews"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-violet-50 hover:bg-violet-100 text-violet-800 border border-violet-200 rounded-xl font-bold text-[11px] transition-colors"
+                      >
+                        <CalendarClock className="w-3.5 h-3.5" />
+                        Subscribe to Calendar
+                      </a>
+                    )}
                     {slot.meetingUrl && (
                       <a
                         href={slot.meetingUrl}
@@ -231,6 +265,67 @@ export const PlacementTracker: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* My Offers — real offer lifecycle (accept / decline with deadline) */}
+      {offers.length > 0 && (
+        <div className="bg-white rounded-2xl p-6 border border-emerald-200/80 shadow-xs space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div>
+              <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <Award className="w-4 h-4 text-emerald-600" />
+                My Offers
+              </h2>
+              <p className="text-xs text-slate-500">Formal offers from recruiters — respond before the deadline</p>
+            </div>
+            <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+              {offers.filter(o => o.status === 'pending').length} pending
+            </span>
+          </div>
+          <div className="space-y-3">
+            {offers.map(o => (
+              <div key={o.id} className={`p-4 rounded-2xl border space-y-3 ${
+                o.status === 'pending' ? 'border-emerald-300 bg-emerald-50/50'
+                : o.status === 'accepted' ? 'border-emerald-200 bg-emerald-50/30'
+                : 'border-slate-200 bg-slate-50/60 opacity-75'
+              }`}>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-bold text-slate-900">{o.jobTitle}</p>
+                    <p className="text-[11px] text-slate-500">{o.company}{o.salaryText ? ` • ${o.salaryText}` : ''}</p>
+                  </div>
+                  <span className={`px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase tracking-wider ${
+                    o.status === 'pending' ? 'bg-emerald-600 text-white'
+                    : o.status === 'accepted' ? 'bg-emerald-100 text-emerald-800'
+                    : 'bg-slate-300 text-slate-700'
+                  }`}>
+                    {o.status}
+                  </span>
+                </div>
+                {o.status === 'pending' && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[10px] text-slate-500">Respond by {new Date(o.deadline).toLocaleDateString()}</span>
+                    <div className="flex-1" />
+                    <button
+                      onClick={() => respondOffer(o.id, 'accepted')}
+                      disabled={!!offerBusyId}
+                      className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded-xl font-bold text-[11px]"
+                    >
+                      {offerBusyId === o.id ? '…' : '✓ Accept Offer'}
+                    </button>
+                    <button
+                      onClick={() => respondOffer(o.id, 'declined')}
+                      disabled={!!offerBusyId}
+                      className="px-3.5 py-2 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 rounded-xl font-bold text-[11px]"
+                    >
+                      Decline
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Applications List */}
       <div className="bg-white rounded-2xl p-6 border border-slate-200/80 shadow-xs space-y-6">

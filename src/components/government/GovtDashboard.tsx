@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
 import { GOVT_REGIONAL_STATS, EMERGING_SKILL_TRENDS } from '../../data/mockData';
+import { api } from '../../services/api';
 import {
   Landmark,
   ShieldCheck,
@@ -28,6 +29,19 @@ import {
 } from 'recharts';
 
 export const GovtDashboard: React.FC = () => {
+  const [regionalStats, setRegionalStats] = useState(GOVT_REGIONAL_STATS);
+  const [skillTrends, setSkillTrends] = useState(EMERGING_SKILL_TRENDS);
+
+  useEffect(() => {
+    api.getAnalytics().then(res => {
+      if (res.govtRegionalStats && res.govtRegionalStats.length > 0) {
+        setRegionalStats(res.govtRegionalStats);
+      }
+      if (res.emergingSkillTrends && res.emergingSkillTrends.length > 0) {
+        setSkillTrends(res.emergingSkillTrends);
+      }
+    }).catch(console.error);
+  }, []);
   const { activeTab, setActiveTab, setNotification } = useApp();
   const [selectedRegionFilter, setSelectedRegionFilter] = useState<string>('all');
 
@@ -99,8 +113,8 @@ export const GovtDashboard: React.FC = () => {
   ];
 
   const filteredRegions = selectedRegionFilter === 'all' 
-    ? GOVT_REGIONAL_STATS 
-    : GOVT_REGIONAL_STATS.filter(r => r.region.toLowerCase().includes(selectedRegionFilter.toLowerCase()));
+    ? regionalStats 
+    : regionalStats.filter(r => r.region.toLowerCase().includes(selectedRegionFilter.toLowerCase()));
 
   return (
     <div className="space-y-6 animate-fadeIn">
@@ -115,7 +129,7 @@ export const GovtDashboard: React.FC = () => {
               </span>
               <span className="text-xs text-blue-200">NEP 2020 Implementation Oversight</span>
             </div>
-            <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Macro Skill & Placement Governance</h1>
+            <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Policy & Macro-Analytics View</h1>
             <p className="text-blue-200 text-xs sm:text-sm mt-1 max-w-2xl leading-relaxed">
               State-level analytics platform connecting universities, technical councils, and corporate employers to eliminate regional skill disparities.
             </p>
@@ -270,7 +284,7 @@ export const GovtDashboard: React.FC = () => {
 
             <div className="h-72 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={GOVT_REGIONAL_STATS} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
+                <BarChart data={regionalStats} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                   <XAxis dataKey="region" tick={{ fontSize: 10, fill: '#64748b' }} />
                   <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#64748b' }} unit="%" />
@@ -406,7 +420,7 @@ export const GovtDashboard: React.FC = () => {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {EMERGING_SKILL_TRENDS.map((trend, idx) => (
+              {skillTrends.map((trend, idx) => (
                 <div
                   key={idx}
                   className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5 hover:border-blue-300 transition-colors"

@@ -57,9 +57,9 @@ export function checkRateLimit(key: string, maxHits = MAX_HITS): RateLimitResult
 }
 
 export function clientIpOf(req: any): string {
-  return (
-    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-    req.socket?.remoteAddress ||
-    'unknown'
-  );
+  // Express resolves req.ip through `trust proxy` (app.set in index.ts), so
+  // behind a real proxy this is the client IP and NOT a spoofable header:
+  // with trust proxy enabled Express only trusts the configured hop count.
+  const ip = typeof req.ip === 'string' && req.ip ? req.ip : req.socket?.remoteAddress || 'unknown';
+  return ip;
 }

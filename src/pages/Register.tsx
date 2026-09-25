@@ -105,7 +105,7 @@ export const Register: React.FC = () => {
     },
     { 
       id: 'college', 
-      label: 'College', 
+      label: 'Institution', 
       desc: 'Curriculum gap analysis, MoUs & TPO',
       icon: Building2 
     },
@@ -115,12 +115,7 @@ export const Register: React.FC = () => {
       desc: 'Post jobs, publish capstones & hire talent',
       icon: Briefcase 
     },
-    { 
-      id: 'government', 
-      label: 'Government', 
-      desc: 'Regional policy, grants & youth readiness',
-      icon: Landmark 
-    },
+    
     {
       id: 'alumni',
       label: 'Alumni / Mentor',

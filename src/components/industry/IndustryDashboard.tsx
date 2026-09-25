@@ -649,6 +649,29 @@ export const IndustryDashboard: React.FC = () => {
                           {slot.status === 'scheduled' ? (
                             <div className="flex items-center justify-end gap-1.5">
                               <button
+                                onClick={async () => {
+                                  const input = window.prompt('New date & time for this interview', '');
+                                  if (!input) return;
+                                  const when = new Date(input);
+                                  if (isNaN(when.getTime()) || when.getTime() < Date.now()) {
+                                    setNotification('Please enter a valid future date/time.');
+                                    return;
+                                  }
+                                  try {
+                                    await api.rescheduleInterview(slot.id, when.toISOString());
+                                    setNotification('Interview rescheduled — student notified with a fresh calendar invite.');
+                                    await loadSchedule();
+                                  } catch (e: any) {
+                                    setNotification(e?.message || 'Reschedule failed.');
+                                  }
+                                }}
+                                disabled={!!slotBusyId}
+                                className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold text-[10px]"
+                                title="Move this interview to a new time"
+                              >
+                                ⟳ Move
+                              </button>
+                              <button
                                 onClick={() => setSlotStatus(slot.id, 'completed')}
                                 disabled={!!slotBusyId}
                                 className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded-lg font-bold text-[10px]"

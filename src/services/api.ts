@@ -43,7 +43,7 @@ export function clearSession() {
 }
 
 /** fetch wrapper that attaches the JWT and normalizes auth errors. */
-async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+export async function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const token = getToken();
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string> || {}),
@@ -73,6 +73,11 @@ export interface BackendHealth {
 }
 
 export const api = {
+  async getAnalytics(): Promise<any> {
+    const res = await fetch(`${API_BASE}/analytics`);
+    if (!res.ok) throw new Error('Failed to fetch analytics');
+    return res.json();
+  },
   async getHealth(): Promise<BackendHealth | null> {
     try {
       const res = await fetch(`${API_BASE}/health`);
@@ -314,6 +319,122 @@ export const api = {
       throw new Error(err.error || 'Failed to resend the invitation');
     }
     return await res.json();
+  },
+
+  async rescheduleInterview(slotId: string, scheduledAt: string): Promise<{ success: boolean; slot: { id: string; scheduledAt: string } }> {
+    const res = await authFetch(`${API_BASE}/interview-slots/${slotId}/reschedule`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scheduledAt }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to reschedule');
+    }
+    return await res.json();
+  },
+
+  async inviteTalent(studentId: string, message?: string): Promise<{ success: boolean; studentName: string }> {
+    const res = await authFetch(`${API_BASE}/talent/invite`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ studentId, message }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to send the invitation');
+    }
+    return await res.json();
+  },
+
+  async extendOffer(applicationId: string, payload: { salaryText?: string; joiningDate?: string; deadlineDays?: number }): Promise<{ success: boolean; offerId: string; deadline: string }> {
+    const res = await authFetch(`${API_BASE}/applications/${applicationId}/offer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to extend the offer');
+    }
+    return await res.json();
+  },
+
+  async getMyOffers(): Promise<{ success: boolean; offers: { id: string; status: string; salaryText?: string; joiningDate?: string; deadline: string; createdAt: string; jobTitle: string; company: string; applicationId: string }[] }> {
+    const res = await authFetch(`${API_BASE}/me/offers`);
+    if (!res.ok) throw new Error('Failed to load offers');
+    return await res.json();
+  },
+
+  async respondToOffer(offerId: string, decision: 'accepted' | 'declined'): Promise<{ success: boolean; decision: string }> {
+    const res = await authFetch(`${API_BASE}/offers/${offerId}/respond`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to respond');
+    }
+    return await res.json();
+  },
+
+  async createInterviewWindow(jobId: string, payload: { startAt: string; endAt: string; slotMinutes?: number; capacity?: number }): Promise<{ success: boolean; windowId: string }> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}/windows`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to create the window');
+    }
+    return await res.json();
+  },
+
+  async getJobWindows(jobId: string): Promise<{ success: boolean; windows: { id: string; startAt: string; endAt: string; slotMinutes: number; capacity: number; booked: number }[] }> {
+    const res = await fetch(`${API_BASE}/jobs/${jobId}/windows`);
+    if (!res.ok) throw new Error('Failed to load windows');
+    return await res.json();
+  },
+
+  async bookWindowSlot(windowId: string): Promise<{ success: boolean; slotId: string; scheduledAt: string; durationMinutes: number }> {
+    const res = await authFetch(`${API_BASE}/windows/${windowId}/book`, { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to book the slot');
+    }
+    return await res.json();
+  },
+
+  async addJobCollaborator(jobId: string, email: string): Promise<{ success: boolean; added: string }> {
+    const res = await authFetch(`${API_BASE}/jobs/${jobId}/collaborators`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to add the collaborator');
+    }
+    return await res.json();
+  },
+
+  async getCalendarFeed(): Promise<{ success: boolean; url: string }> {
+    const res = await authFetch(`${API_BASE}/me/calendar-token`);
+    if (!res.ok) throw new Error('Failed to load the calendar feed');
+    return await res.json();
+  },
+
+  async rotateCalendarFeed(): Promise<{ success: boolean; url: string }> {
+    const res = await authFetch(`${API_BASE}/me/calendar-token/rotate`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to rotate the calendar token');
+    return await res.json();
+  },
+
+  async logout(): Promise<{ success: boolean }> {
+    const res = await authFetch(`${API_BASE}/auth/logout`, { method: 'POST' }).catch(() => null);
+    return { success: !!res && res.ok };
   },
 
   async getRecruiterInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[]; counts: { scheduled: number; completed: number; cancelled: number } }> {

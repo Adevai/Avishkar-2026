@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
-import { getAssessmentQuestionsForRole } from '../../data/roleAssessments';
+import { api, API_BASE } from '../../services/api';
+import { Loader2 } from 'lucide-react';
+import { ASSESSMENT_QUESTIONS } from '../../data/mockData';
 import { 
   BrainCircuit, 
   Clock, 
@@ -57,10 +59,11 @@ export const AIAssessment: React.FC = () => {
   const [sandboxRunning, setSandboxRunning] = useState(false);
   const [sandboxOutput, setSandboxOutput] = useState<string | null>(null);
 
-  // Dynamically load questions tailored to the student's chosen career goal
-  const questions = useMemo(() => {
-    return getAssessmentQuestionsForRole(student?.targetRole);
-  }, [student?.targetRole]);
+  // Dynamic AI-generated questions tailored to the student's chosen career goal.
+  // Falls back to the static bank while generating or if generation fails.
+  const [questions, setQuestions] = useState<any[]>(cachedData?.questions || ASSESSMENT_QUESTIONS);
+  const [assessmentId, setAssessmentId] = useState<string | null>(cachedData?.assessmentId || null);
+  const [isGenerating, setIsGenerating] = useState(false);
 
   // Lock user in while test is running & monitor anti-cheat proctoring events
   useEffect(() => {
@@ -124,11 +127,13 @@ export const AIAssessment: React.FC = () => {
           currentIdx,
           selectedAnswers,
           timeRemaining,
+          questions,
+          assessmentId,
           targetRole: student?.targetRole,
         })
       );
     } catch (e) {}
-  }, [hasStarted, currentIdx, selectedAnswers, timeRemaining, isFinished, student?.targetRole]);
+  }, [hasStarted, currentIdx, selectedAnswers, timeRemaining, isFinished, student?.targetRole, questions, assessmentId]);
 
   useEffect(() => {
     if (!hasStarted || isFinished || timeRemaining <= 0) return;
@@ -185,7 +190,12 @@ export const AIAssessment: React.FC = () => {
       localStorage.removeItem('spark_assessment_locked');
     } catch (e) {}
     const timeSpent = 600 - timeRemaining;
-    await submitAssessment(selectedAnswers, timeSpent, questions);
+    if (assessmentId) {
+      await submitAssessment(assessmentId, selectedAnswers, timeSpent);
+    } else {
+      // Static-bank fallback: keep the legacy grading path
+      await submitAssessment(`static-${Date.now()}`, selectedAnswers, timeSpent);
+    }
 
     // Issue Cryptographically Verifiable Digital Badge
     try {
@@ -226,6 +236,41 @@ export const AIAssessment: React.FC = () => {
     }, 1200);
   };
 
+  // Generate a fresh AI assessment for the student's target role. If the
+  // server cannot generate (missing key, upstream failure), fall back to the
+  // static question bank so the assessment always works.
+  const startDynamicAssessment = async () => {
+    setIsGenerating(true);
+    try {
+      const res = await fetch(`${API_BASE}/assessment/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: student?.targetRole || 'Software Engineer' }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.questions) && data.questions.length > 0) {
+          setQuestions(data.questions);
+          setAssessmentId(data.assessmentId);
+          setCurrentIdx(0);
+          setSelectedAnswers({});
+        } else {
+          setQuestions(ASSESSMENT_QUESTIONS);
+          setAssessmentId(null);
+        }
+      } else {
+        setQuestions(ASSESSMENT_QUESTIONS);
+        setAssessmentId(null);
+      }
+    } catch (e) {
+      setQuestions(ASSESSMENT_QUESTIONS);
+      setAssessmentId(null);
+    } finally {
+      setIsGenerating(false);
+      setHasStarted(true);
+    }
+  };
+
   if (!hasStarted) {
     return (
       <div className="max-w-2xl mx-auto mt-10 p-8 fintech-card flex flex-col items-center text-center animate-in fade-in zoom-in duration-500">
@@ -260,11 +305,12 @@ export const AIAssessment: React.FC = () => {
         </div>
 
         <button 
-          onClick={() => setHasStarted(true)}
-          className="fintech-btn-primary w-full bg-gradient-to-r from-blue-600 to-violet-600 shadow-blue-500/25"
-        >
-          I Understand, Start Assessment
-        </button>
+          onClick={startDynamicAssessment}
+            disabled={isGenerating}
+            className="fintech-btn-primary w-full bg-gradient-to-r from-blue-600 to-violet-600 shadow-blue-500/25 disabled:opacity-50"
+          >
+            {isGenerating ? <><Loader2 className="w-5 h-5 animate-spin mr-2" /> Generating AI Assessment...</> : 'I Understand, Start Assessment'}
+          </button>
       </div>
     );
   }
@@ -455,7 +501,7 @@ export const AIAssessment: React.FC = () => {
 
         {/* Options */}
         <div className="space-y-3 pt-2">
-          {currentQ.options.map((opt, oIdx) => {
+          {currentQ.options.map((opt: any, oIdx: number) => {
             const isSelected = selectedAnswers[currentQ.id] === oIdx;
             return (
               <button

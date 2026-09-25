@@ -3,18 +3,16 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// SMTP settings are environment-only — no credential fallbacks in code.
-// In non-production, a missing/misconfigured SMTP keeps signup and email
-// flows alive via the DEV fallbacks in each sender (logged OTP / reminder).
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+// SMTP settings configured for real transactional providers (e.g. SendGrid, AWS SES, Resend)
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.sendgrid.net';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10) || 587;
-const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_USER = process.env.EMAIL_USER || 'apikey'; // SendGrid uses 'apikey' as username
 const EMAIL_PASS = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
 
-if (!EMAIL_USER || !EMAIL_PASS) {
+if (!EMAIL_PASS) {
   const scope = process.env.NODE_ENV === 'production' ? 'PRODUCTION' : 'dev';
   console.warn(
-    `[EmailService] EMAIL_USER/EMAIL_PASS not set — real email sending is disabled (${scope}).` +
+    `[EmailService] EMAIL_PASS not set ?" real email sending is disabled (${scope}).` +
     (process.env.NODE_ENV !== 'production' ? ' DEV fallbacks will be used for OTPs and reminders.' : ' Configure SMTP before deploying!')
   );
 }
@@ -22,14 +20,8 @@ if (!EMAIL_USER || !EMAIL_PASS) {
 const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: SMTP_PORT,
-  secure: false, // TLS
-  requireTLS: true,
-  ...(EMAIL_USER && EMAIL_PASS
-    ? { auth: { user: EMAIL_USER, pass: EMAIL_PASS } }
-    : {}),
-  tls: {
-    rejectUnauthorized: false,
-  },
+  secure: SMTP_PORT === 465, // Use true for 465, false for 587
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS }
 });
 
 export async function sendOtpEmail({
@@ -276,7 +268,7 @@ export async function sendRegistrationOtpEmail({
   }
 }
 
-function icsEscape(text: string): string {
+export function icsEscape(text: string): string {
   return String(text)
     .replace(/\\/g, '\\\\')
     .replace(/;/g, '\\;')
@@ -284,7 +276,7 @@ function icsEscape(text: string): string {
     .replace(/\r?\n/g, '\\n');
 }
 
-function icsBasicUtc(iso: string): string {
+export function icsBasicUtc(iso: string): string {
   return new Date(iso).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
 }
 

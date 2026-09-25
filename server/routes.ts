@@ -1,5 +1,9 @@
 import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
 import multer from 'multer';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { PDFParse } from 'pdf-parse';
 import { query, pool } from './db';
 import { ASSESSMENT_QUESTIONS, COLLEGE_DEPARTMENT_STATS, GOVT_REGIONAL_STATS, EMERGING_SKILL_TRENDS } from '../src/data/mockData';
@@ -8,8 +12,10 @@ import { askCopilot } from '../src/utils/geminiService';
 import { extractSkillsFromText } from './nlpEngine';
 import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail, buildInterviewIcs, sendInterviewConfirmationEmail } from './emailService';
 import { getCollegeDepartmentStats, getGovtRegionalStats, getEmergingSkillTrends } from './analytics';
+import { icsEscape as icsEscapeText, icsBasicUtc as icsBasicUtcTime } from './emailService';
 import { checkRateLimit, clientIpOf } from './rateLimit';
-import { hashPassword, comparePassword, signToken, requireAuth } from './auth';
+import { enqueueEmail } from './emailOutbox';
+import { hashPassword, comparePassword, signToken, signRefreshToken, verifyRefreshToken, requireAuth, requireAdmin } from './auth';
 import { verifyInstitutionServer } from './institutionVerify';
 import { aggregateJobs } from './jobAggregator';
 import { addClient, removeClient, emitEvent, connectedClients } from './events';
@@ -22,6 +28,189 @@ const upload = multer({
 });
 
 export const router = Router();
+
+// --- DYNAMIC AI ASSESSMENT ENGINE ---
+
+// In-memory store for active assessments (for grading). In production, use Redis or Postgres.
+const activeAssessments = new Map<string, any>();
+
+router.post('/assessment/generate', async (req: Request, res: Response) => {
+  const { role } = req.body;
+  if (!role) return res.status(400).json({ error: 'Role is required' });
+
+  // Abuse guard: this endpoint calls Gemini on the server's key.
+  const rl = checkRateLimit(`assessment-gen:${clientIpOf(req)}`, 10);
+  if (!rl.allowed) {
+    return res.status(429).json({ error: 'Assessment generation limit reached. Try again shortly.' });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
+  }
+
+  try {
+    const prompt = `
+      Generate 15 multiple-choice assessment questions for a ${role}.
+      Make them difficult, covering Fundamentals, Backend Systems, Frontend Web, Cloud & DevOps, AI & Data, and Soft Skills.
+      Return ONLY a valid JSON array where each object has:
+      {
+        "category": "category_name",
+        "categoryName": "Display Name",
+        "question": "The question text",
+        "options": ["A", "B", "C", "D"],
+        "correctAnswer": 0,
+        "explanation": "Explanation of the correct answer",
+        "difficulty": "medium"
+      }
+    `;
+
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json" }
+      })
+    });
+
+    if (!response.ok) throw new Error('Gemini API call failed');
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!rawText) throw new Error('Empty response from Gemini');
+    
+    const questions = JSON.parse(rawText);
+    const assessmentId = `assessment-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    
+    // Store securely on backend for grading (bounded so abandoned sessions
+    // can't grow the map without limit)
+    activeAssessments.set(assessmentId, questions);
+    if (activeAssessments.size > 500) {
+      const oldest = activeAssessments.keys().next().value as string | undefined;
+      if (oldest) activeAssessments.delete(oldest);
+    }
+    
+    // Strip correct answers before sending to frontend
+    const clientQuestions = questions.map((q: any, i: number) => ({
+      id: `q-${i}`,
+      category: q.category,
+      categoryName: q.categoryName,
+      question: q.question,
+      options: q.options,
+      difficulty: q.difficulty
+    }));
+
+    res.json({ success: true, assessmentId, questions: clientQuestions });
+  } catch (error: any) {
+    console.error('Failed to generate assessment:', error);
+    res.status(500).json({ error: 'Failed to generate assessment' });
+  }
+});
+
+router.post('/assessment/grade', async (req: Request, res: Response) => {
+  const { assessmentId, answers, timeSpentSeconds, studentId } = req.body;
+  if (!assessmentId || !answers) return res.status(400).json({ error: 'Missing required fields' });
+
+  const sessionQuestions = activeAssessments.get(assessmentId);
+  // Unknown session (e.g. static-bank fallback after generation failure):
+  // grade against the shipped question bank using its real question ids.
+  const staticBank = !sessionQuestions;
+  const originalQuestions: any[] = sessionQuestions || ASSESSMENT_QUESTIONS;
+  if (originalQuestions.length === 0) {
+    return res.status(404).json({ error: 'Assessment session expired or not found' });
+  }
+
+  let score = 0;
+  const categoryScores: Record<string, number> = {};
+  const categoryCounts: Record<string, number> = {};
+
+  originalQuestions.forEach((q: any, i: number) => {
+    const qId = staticBank ? q.id : `q-${i}`;
+    const selected = answers[qId];
+    
+    if (!categoryCounts[q.category]) categoryCounts[q.category] = 0;
+    if (!categoryScores[q.category]) categoryScores[q.category] = 0;
+    categoryCounts[q.category]++;
+
+    if (selected === q.correctAnswer) {
+      score++;
+      categoryScores[q.category]++;
+    }
+  });
+
+  const percentage = Math.round((score / originalQuestions.length) * 100);
+  
+  Object.keys(categoryScores).forEach(cat => {
+    categoryScores[cat] = Math.round((categoryScores[cat] / categoryCounts[cat]) * 100);
+  });
+
+  let performanceGrade = 'Needs Improvement';
+  if (percentage >= 90) performanceGrade = 'Expert';
+  else if (percentage >= 75) performanceGrade = 'Proficient';
+  else if (percentage >= 60) performanceGrade = 'Competent';
+
+  // Cleanup
+  if (!staticBank) activeAssessments.delete(assessmentId);
+
+  // Persist the attempt (score + readiness + roadmap) so the student registry,
+  // NIRF export and readiness analytics reflect this assessment.
+  let persisted = false;
+  if (studentId && typeof studentId === 'string') {
+    try {
+      const assessmentRowId = `asm-dyn-${Date.now().toString().slice(-6)}`;
+      await query(
+        `INSERT INTO assessments (
+          id, student_id, total_score, max_score, percentage, category_scores,
+          time_spent_seconds, performance_grade
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          assessmentRowId,
+          studentId,
+          score,
+          originalQuestions.length,
+          percentage,
+          JSON.stringify(categoryScores),
+          timeSpentSeconds || 600,
+          performanceGrade,
+        ]
+      );
+      const studentRes = await query('SELECT readiness_score FROM students WHERE id = $1', [studentId]);
+      if (studentRes.rows.length > 0) {
+        const newReadiness = Math.round(((studentRes.rows[0].readiness_score || 70) + percentage) / 2);
+        await query(
+          `UPDATE students SET assessment_completed = TRUE, readiness_score = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+          [newReadiness, studentId]
+        );
+      }
+      const rmCheck = await query('SELECT id FROM roadmaps WHERE student_id = $1', [studentId]);
+      if (rmCheck.rows.length === 0) {
+        const milestones = await generateDefaultRoadmap(studentId);
+        await query(
+          'INSERT INTO roadmaps (id, student_id, milestones) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING',
+          [`rdm-${studentId}`, studentId, JSON.stringify(milestones)]
+        );
+      }
+      persisted = true;
+    } catch (persistErr: any) {
+      console.error('assessment/grade persist failed:', persistErr.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    persisted,
+    result: {
+      completedAt: new Date().toISOString(),
+      totalScore: score,
+      maxScore: originalQuestions.length,
+      percentage,
+      categoryScores,
+      timeSpentSeconds,
+      performanceGrade
+    }
+  });
+});
 
 // ==========================================
 // 0. SERVER-SENT EVENTS (REAL-TIME PUSH)
@@ -431,6 +620,14 @@ router.post('/students/:id/upload-resume', upload.single('resume'), async (req: 
     const studentRes = await query('SELECT * FROM students WHERE id = $1', [req.params.id]);
     const student = studentRes.rows[0];
 
+    // Persist the original file to local disk (uploads/resumes) so it
+    // survives restarts and can be served via an expiring signed URL.
+    const resumeDir = path.resolve(process.cwd(), 'uploads', 'resumes');
+    await fs.promises.mkdir(resumeDir, { recursive: true });
+    const safeName = `${req.params.id}-${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const resumePath = path.join(resumeDir, safeName);
+    await fs.promises.writeFile(resumePath, file.buffer);
+
     let extractedText = '';
     const isPdf = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf');
 
@@ -463,11 +660,13 @@ router.post('/students/:id/upload-resume', upload.single('resume'), async (req: 
         `UPDATE students SET
           resume_uploaded = TRUE,
           resume_name = $1,
-          declared_skills = $2,
-          readiness_score = $3,
+          resume_path = $2,
+          resume_uploaded_at = CURRENT_TIMESTAMP,
+          declared_skills = $3,
+          readiness_score = $4,
           updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4`,
-        [file.originalname, JSON.stringify(merged), newReadiness, req.params.id]
+         WHERE id = $5`,
+        [file.originalname, resumePath, JSON.stringify(merged), newReadiness, req.params.id]
       );
 
       await query(
@@ -1004,15 +1203,48 @@ async function requireJobOwner(req: Request, res: Response): Promise<any | null>
   }
   const job = jobRes.rows[0];
   const recruiter = (req as any).user;
+  // Team access: the poster OR an added collaborator may manage the posting.
   if (job.posted_by && job.posted_by !== recruiter.sub) {
-    res.status(403).json({ error: 'Only the recruiter who posted this job can manage it.' });
-    return null;
+    const collab = await query(
+      `SELECT 1 FROM job_collaborators WHERE job_id = $1 AND user_id = $2`,
+      [job.id, recruiter.sub]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (collab.rows.length === 0) {
+      res.status(403).json({ error: 'Only the recruiter who posted this job (or a teammate) can manage it.' });
+      return null;
+    }
   }
   if (!job.posted_by) {
     res.status(403).json({ error: 'This listing was synced from an external platform and cannot be managed here.' });
     return null;
   }
   return job;
+}
+
+// Resolve the linked login account (users.id) for a student record, if any.
+// Data-only students (no own login) have no users row.
+async function resolveStudentUserId(studentId: string): Promise<string | null> {
+  try {
+    const r = await query(
+      `SELECT u.id FROM users u WHERE LOWER(u.email) = (SELECT LOWER(email) FROM students WHERE id = $1)`,
+      [studentId]
+    );
+    return r.rows[0]?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+// Persist a notification for a REAL login account only. notifications.user_id
+// carries a foreign key to users(id); writing a bare students.id would violate
+// it (or be unreadable by GET /notifications). Students without a linked
+// account still receive the SSE event.
+async function insertNotification(userId: string | null, title: string, message: string, type: string) {
+  if (!userId) return;
+  await query(
+    `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
+    [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, userId, title, message, type]
+  ).catch(() => {});
 }
 
 function notifyJobApplicants(jobId: string, jobTitle: string, company: string, title: string, message: string) {
@@ -1023,13 +1255,9 @@ function notifyJobApplicants(jobId: string, jobTitle: string, company: string, t
       [jobId]
     );
     for (const row of apps.rows) {
-      const studentUserId = await query(`SELECT id FROM users WHERE LOWER(email) = (SELECT LOWER(email) FROM students WHERE id = $1)`, [row.student_id]);
-      const uid = studentUserId.rows[0]?.id || row.student_id;
-      await query(
-        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, 'alert')`,
-        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, title, message]
-      ).catch(() => {});
-      emitEvent({
+      const uid = await resolveStudentUserId(row.student_id);
+      await insertNotification(uid, title, message, 'alert');
+      if (uid) emitEvent({
         type: 'application_update',
         title,
         message,
@@ -1182,22 +1410,14 @@ router.patch('/applications/bulk-status', requireAuth, async (req: Request, res:
 
     // Notify every affected student (best-effort, non-blocking)
     for (const row of result.rows) {
-      const uidRes = await query(
-        `SELECT u.id FROM users u WHERE LOWER(u.email) = (SELECT LOWER(email) FROM students WHERE id = $1)`,
-        [row.student_id]
-      ).catch(() => ({ rows: [] as any[] }));
-      const uid = uidRes.rows[0]?.id || row.student_id;
-      await query(
-        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
-        [
-          `notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-          uid,
-          `Application ${status}`,
-          `Your application for ${row.job_title} at ${row.company} moved to: ${status}`,
-          status === 'Rejected' ? 'alert' : 'success',
-        ]
-      ).catch(() => {});
-      emitEvent({
+      const uid = await resolveStudentUserId(row.student_id);
+      await insertNotification(
+        uid,
+        `Application ${status}`,
+        `Your application for ${row.job_title} at ${row.company} moved to: ${status}`,
+        status === 'Rejected' ? 'alert' : 'success'
+      );
+      if (uid) emitEvent({
         type: 'application_update',
         title: `Application ${status}`,
         message: `Your application for ${row.job_title} at ${row.company} moved to: ${status}`,
@@ -1265,17 +1485,10 @@ router.post('/applications/schedule-interviews', requireAuth, async (req: Reques
         [app.id, JSON.stringify([{ stage: 'Interview Scheduled', date: new Date().toISOString().split('T')[0], note: `Interview booked for ${whenLabel} (${interviewMode})` }])]
       );
 
-      const uidRes = await query(
-        `SELECT u.id FROM users u WHERE LOWER(u.email) = (SELECT LOWER(email) FROM students WHERE id = $1)`,
-        [app.student_id]
-      ).catch(() => ({ rows: [] as any[] }));
-      const uid = uidRes.rows[0]?.id || app.student_id;
+      const uid = await resolveStudentUserId(app.student_id);
       const istLabel = when.toLocaleString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
-      await query(
-        `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
-        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, 'Interview Scheduled', `Your interview for ${app.job_title} at ${app.company} is booked for ${istLabel} IST (${interviewMode}).`, 'success']
-      ).catch(() => {});
-      emitEvent({
+      await insertNotification(uid, 'Interview Scheduled', `Your interview for ${app.job_title} at ${app.company} is booked for ${istLabel} IST (${interviewMode}).`, 'success');
+      if (uid) emitEvent({
         type: 'application_update',
         title: 'Interview Scheduled',
         message: `Your interview for ${app.job_title} at ${app.company} is booked for ${whenLabel} (${interviewMode}).`,
@@ -1386,20 +1599,13 @@ router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: 
     );
     const jobTitle = detail.rows[0]?.job_title || 'your interview';
     const company = detail.rows[0]?.company || '';
-    const uidRes = await query(
-      `SELECT u.id FROM users u WHERE u.id = (SELECT user_id FROM students WHERE id = $1)`,
-      [slot.student_id]
-    ).catch(() => ({ rows: [] as any[] }));
-    const uid = uidRes.rows[0]?.id || slot.student_id;
+    const uid = await resolveStudentUserId(slot.student_id);
     const title = status === 'completed' ? 'Interview Completed' : 'Interview Cancelled';
     const message = status === 'completed'
       ? `Your interview for ${jobTitle} at ${company} was marked completed. Results will follow soon.`
       : `Your interview for ${jobTitle} at ${company} scheduled for ${new Date(slot.scheduled_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST was cancelled by the recruiter.`;
-    await query(
-      `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
-      [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, title, message, status === 'completed' ? 'success' : 'alert']
-    ).catch(() => {});
-    emitEvent({ type: 'application_update', title, message, targetUserId: uid, data: { slotId: slot.id, status } });
+    await insertNotification(uid, title, message, status === 'completed' ? 'success' : 'alert');
+    if (uid) emitEvent({ type: 'application_update', title, message, targetUserId: uid, data: { slotId: slot.id, status } });
 
     res.json({ success: true, slot: { id: slot.id, status: slot.status, jobTitle, company } });
   } catch (error: any) {
@@ -1499,6 +1705,401 @@ router.post('/interview-slots/:slotId/resend-invite', requireAuth, async (req: R
   }
 });
 
+// ── Reschedule a slot (owner-only): new time, re-notify, fresh ICS invite ──
+router.patch('/interview-slots/:slotId/reschedule', requireAuth, async (req: Request, res: Response) => {
+  const { scheduledAt } = req.body || {};
+  const when = new Date(String(scheduledAt || ''));
+  if (!scheduledAt || isNaN(when.getTime()) || when.getTime() < Date.now() - 60_000) {
+    return res.status(400).json({ error: 'scheduledAt must be a valid future date/time (ISO string).' });
+  }
+  try {
+    const recruiter = (req as any).user;
+    const result = await query(
+      `UPDATE interview_slots s SET scheduled_at = $1,
+              reminder_24h_sent_at = NULL, reminder_2h_sent_at = NULL
+        WHERE s.id = $2 AND s.job_id IN (SELECT id FROM jobs WHERE posted_by = $3)
+        RETURNING *`,
+      [when.toISOString(), req.params.slotId, recruiter.sub]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Slot not found (or you do not own its job).' });
+    }
+    const slot = result.rows[0];
+    const detail = await query(
+      `SELECT j.title AS job_title, j.company FROM interview_slots s JOIN jobs j ON j.id = s.job_id WHERE s.id = $1`,
+      [slot.id]
+    );
+    const jobTitle = detail.rows[0]?.job_title || 'your interview';
+    const company = detail.rows[0]?.company || '';
+    const uidRes = await query(`SELECT user_id FROM students WHERE id = $1`, [slot.student_id]);
+    const uid: string | null = uidRes.rows[0]?.user_id || null;
+    const istLabel = when.toLocaleString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+    const title = 'Interview Rescheduled';
+    const message = `Your interview for ${jobTitle} at ${company} moved to ${istLabel} IST. A fresh calendar invite is on its way.`;
+    await insertNotification(uid, title, message, 'success');
+    if (uid) emitEvent({ type: 'application_update', title, message, targetUserId: uid, data: { slotId: slot.id, scheduledAt: when.toISOString() } });
+
+    // Fresh invitation email with the updated .ics (queued through the outbox).
+    (async () => {
+      const em = await query(
+        `SELECT COALESCE(u.email, s2.email) AS email, COALESCE(s2.name, split_part(COALESCE(u.email, s2.email), '@', 1)) AS name
+           FROM students s2 LEFT JOIN users u ON u.id = s2.user_id WHERE s2.id = $1`,
+        [slot.student_id]
+      );
+      const to = em.rows[0]?.email;
+      if (!to) return;
+      const ics = buildInterviewIcs({
+        slotId: slot.id, jobTitle, company,
+        scheduledAt: new Date(slot.scheduled_at).toISOString(),
+        durationMinutes: slot.duration_minutes || 45,
+        mode: slot.mode || 'online',
+        meetingUrl: slot.meeting_url, notes: slot.notes,
+      });
+      await enqueueEmail({
+        to,
+        subject: `[S.P.A.R.K.] Rescheduled: ${jobTitle} @ ${company} — now ${istLabel} (IST)`,
+        text: `Your interview moved to ${istLabel} (IST). Updated calendar invite attached.`,
+        html: `<p>Your interview for <strong>${jobTitle}</strong> at <strong>${company}</strong> was rescheduled to <strong>${istLabel} IST</strong>.</p><p>The updated calendar invite (.ics) is attached.</p>`,
+        ics: { filename: 'interview-invite.ics', content: ics },
+      });
+    })().catch(err => console.error('reschedule email failed:', err.message));
+
+    res.json({ success: true, slot: { id: slot.id, scheduledAt: slot.scheduled_at } });
+  } catch (error: any) {
+    console.error('reschedule failed:', error.message);
+    res.status(500).json({ error: 'Failed to reschedule.' });
+  }
+});
+
+// ── OFFER MANAGEMENT ────────────────────────────────────────────────────────
+// Extend a formal offer on an application (owner-only).
+router.post('/applications/:appId/offer', requireAuth, async (req: Request, res: Response) => {
+  const { salaryText, joiningDate, deadlineDays } = req.body || {};
+  try {
+    const recruiter = (req as any).user;
+    const app = await query(
+      `SELECT a.*, j.posted_by FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = $1`,
+      [req.params.appId]
+    );
+    if (app.rows.length === 0) return res.status(404).json({ error: 'Application not found.' });
+    if (app.rows[0].posted_by !== recruiter.sub) {
+      return res.status(403).json({ error: 'Only the job owner can extend offers.' });
+    }
+    const existing = await query(`SELECT id FROM offers WHERE application_id = $1 AND status = 'pending'`, [req.params.appId]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'A pending offer already exists for this application.' });
+    }
+    const deadline = new Date(Date.now() + Math.min(Math.max(Number(deadlineDays) || 7, 1), 30) * 86_400_000);
+    const offerId = `offer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await query(
+      `INSERT INTO offers (id, application_id, job_id, student_id, recruiter_id, salary_text, joining_date, deadline)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [offerId, app.rows[0].id, app.rows[0].job_id, app.rows[0].student_id, recruiter.sub,
+       salaryText || null, joiningDate || null, deadline.toISOString().slice(0, 10)]
+    );
+    await query(
+      `UPDATE applications SET status = 'Offer Extended', updated_at = CURRENT_TIMESTAMP,
+              stage_history = stage_history || $2::jsonb WHERE id = $1`,
+      [req.params.appId, JSON.stringify([{ stage: 'Offer Extended', date: new Date().toISOString().split('T')[0], note: `Formal offer extended${salaryText ? ` (${salaryText})` : ''}` }])]
+    );
+    const uidRes = await query(`SELECT user_id FROM students WHERE id = $1`, [app.rows[0].student_id]);
+    const uid: string | null = uidRes.rows[0]?.user_id || null;
+    const msg = `🎉 Offer from ${app.rows[0].company} for ${app.rows[0].job_title}! Respond by ${deadline.toISOString().slice(0, 10)}.`;
+    await insertNotification(uid, 'Offer Received', msg, 'success');
+    if (uid) emitEvent({ type: 'application_update', title: 'Offer Received', message: msg, targetUserId: uid, data: { offerId } });
+    res.status(201).json({ success: true, offerId, deadline: deadline.toISOString().slice(0, 10) });
+  } catch (error: any) {
+    console.error('offer extend failed:', error.message);
+    res.status(500).json({ error: 'Failed to extend the offer.' });
+  }
+});
+
+// Student: my offers with live details.
+router.get('/me/offers', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const result = await query(
+      `SELECT o.id, o.status, o.salary_text AS "salaryText", o.joining_date AS "joiningDate",
+              o.deadline, o.created_at AS "createdAt",
+              a.job_title AS "jobTitle", a.company, a.id AS "applicationId"
+         FROM offers o JOIN applications a ON a.id = o.application_id
+        WHERE o.student_id = (SELECT id FROM students WHERE user_id = $1)
+        ORDER BY o.created_at DESC`,
+      [user.sub]
+    );
+    res.json({ success: true, offers: result.rows });
+  } catch (error: any) {
+    console.error('me/offers failed:', error.message);
+    res.status(500).json({ error: 'Failed to load offers.' });
+  }
+});
+
+// Student: accept or decline an offer (deadline enforced server-side).
+router.post('/offers/:offerId/respond', requireAuth, async (req: Request, res: Response) => {
+  const { decision } = req.body || {};
+  if (!['accepted', 'declined'].includes(decision)) {
+    return res.status(400).json({ error: "decision must be 'accepted' or 'declined'." });
+  }
+  try {
+    const user = (req as any).user;
+    const r = await query(
+      `SELECT o.*, j.posted_by, j.title AS job_title, j.company
+         FROM offers o JOIN jobs j ON j.id = o.job_id
+        WHERE o.id = $1 AND o.student_id = (SELECT id FROM students WHERE user_id = $2)`,
+      [req.params.offerId, user.sub]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Offer not found.' });
+    const offer = r.rows[0];
+    if (offer.status !== 'pending') return res.status(409).json({ error: `Offer already ${offer.status}.` });
+    if (offer.deadline && new Date(offer.deadline).getTime() < Date.now()) {
+      return res.status(410).json({ error: 'The offer deadline has passed.' });
+    }
+    await query(`UPDATE offers SET status = $2, responded_at = CURRENT_TIMESTAMP WHERE id = $1`, [offer.id, decision]);
+    if (decision === 'accepted') {
+      await query(
+        `UPDATE applications SET status = 'Offer Accepted', updated_at = CURRENT_TIMESTAMP,
+                stage_history = stage_history || $2::jsonb WHERE id = $1`,
+        [offer.application_id, JSON.stringify([{ stage: 'Offer Accepted', date: new Date().toISOString().split('T')[0], note: 'Candidate accepted the offer' }])]
+      ).catch(() => {});
+    }
+    const status = decision === 'accepted' ? 'Offer Accepted 🎉' : 'Offer Declined';
+    const msg = `${user.name} ${decision} the offer for ${offer.job_title} (${offer.company}).`;
+    await insertNotification(offer.posted_by, status, msg, decision === 'accepted' ? 'success' : 'info');
+    emitEvent({ type: 'application_update', title: status, message: msg, targetUserId: offer.posted_by, data: { offerId: offer.id } });
+    res.json({ success: true, decision });
+  } catch (error: any) {
+    console.error('offer respond failed:', error.message);
+    res.status(500).json({ error: 'Failed to record the decision.' });
+  }
+});
+
+// ── STUDENT SELF-SCHEDULING WINDOWS ─────────────────────────────────────────
+// Recruiter publishes bookable windows on their own job.
+router.post('/jobs/:jobId/windows', requireAuth, async (req: Request, res: Response) => {
+  const { startAt, endAt, slotMinutes, capacity } = req.body || {};
+  const start = new Date(String(startAt || ''));
+  const end = new Date(String(endAt || ''));
+  if (isNaN(start.getTime()) || isNaN(end.getTime()) || end <= start) {
+    return res.status(400).json({ error: 'startAt/endAt must be a valid time range.' });
+  }
+  if (start.getTime() < Date.now()) {
+    return res.status(400).json({ error: 'Windows must start in the future.' });
+  }
+  try {
+    const job = await requireJobOwner(req, res);
+    if (!job) return;
+    const id = `win-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await query(
+      `INSERT INTO interview_windows (id, job_id, recruiter_id, start_at, end_at, slot_minutes, capacity)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, job.id, (req as any).user.sub, start.toISOString(), end.toISOString(),
+       Math.min(Math.max(Number(slotMinutes) || 45, 15), 180), Math.min(Math.max(Number(capacity) || 1, 1), 20)]
+    );
+    res.status(201).json({ success: true, windowId: id });
+  } catch (error: any) {
+    console.error('window create failed:', error.message);
+    res.status(500).json({ error: 'Failed to create the window.' });
+  }
+});
+
+// Windows for a job (owner for management; students see upcoming with availability).
+router.get('/jobs/:jobId/windows', async (req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT w.id, w.start_at AS "startAt", w.end_at AS "endAt", w.slot_minutes AS "slotMinutes",
+              w.capacity,
+              (SELECT count(*)::int FROM interview_slots s WHERE s.window_id = w.id AND s.status = 'scheduled') AS booked
+         FROM interview_windows w
+        WHERE w.job_id = $1 AND w.end_at > NOW()
+        ORDER BY w.start_at ASC`,
+      [req.params.jobId]
+    );
+    res.json({ success: true, windows: result.rows });
+  } catch (error: any) {
+    console.error('windows list failed:', error.message);
+    res.status(500).json({ error: 'Failed to load windows.' });
+  }
+});
+
+// Student books themselves into a window (capacity + one-per-job enforced).
+router.post('/windows/:windowId/book', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const w = await query(`SELECT * FROM interview_windows WHERE id = $1`, [req.params.windowId]);
+    if (w.rows.length === 0) return res.status(404).json({ error: 'Window not found.' });
+    const win = w.rows[0];
+    if (new Date(win.end_at).getTime() < Date.now()) return res.status(410).json({ error: 'This window has closed.' });
+    const booked = await query(`SELECT count(*)::int AS n FROM interview_slots WHERE window_id = $1 AND status = 'scheduled'`, [win.id]);
+    if (booked.rows[0].n >= win.capacity) return res.status(409).json({ error: 'This window is fully booked.' });
+    const stu = await query(`SELECT id FROM students WHERE user_id = $1`, [user.sub]);
+    if (stu.rows.length === 0) return res.status(403).json({ error: 'Only student accounts can book slots.' });
+    const studentId = stu.rows[0].id;
+    const dup = await query(`SELECT id FROM interview_slots WHERE window_id = $1 AND student_id = $2`, [win.id, studentId]);
+    if (dup.rows.length > 0) return res.status(409).json({ error: 'You already booked a slot in this window.' });
+    const appRes = await query(
+      `SELECT id, job_title, company FROM applications WHERE job_id = $1 AND student_id = $2 ORDER BY applied_date DESC LIMIT 1`,
+      [win.job_id, studentId]
+    );
+    if (appRes.rows.length === 0) {
+      return res.status(409).json({ error: 'Apply to this job before booking an interview slot.' });
+    }
+    const app = appRes.rows[0];
+    // Assign the next free slot inside the window: start + booked * slotMinutes.
+    const slotStart = new Date(new Date(win.start_at).getTime() + booked.rows[0].n * win.slot_minutes * 60_000);
+    if (slotStart.getTime() + win.slot_minutes * 60_000 > new Date(win.end_at).getTime() + 86_400_000) {
+      return res.status(409).json({ error: 'No slots remain inside this window.' });
+    }
+    const slotId = `slot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await query(
+      `INSERT INTO interview_slots (id, application_id, job_id, student_id, scheduled_at, duration_minutes, mode, status, created_by, window_id)
+       VALUES ($1, $2, $3, $4, $5, $6, 'online', 'scheduled', $7, $8)`,
+      [slotId, app.id, win.job_id, studentId, slotStart.toISOString(), win.slot_minutes, win.recruiter_id, win.id]
+    );
+    await query(
+      `UPDATE applications SET status = 'Interview Scheduled', updated_at = CURRENT_TIMESTAMP,
+              stage_history = stage_history || $2::jsonb WHERE id = $1`,
+      [app.id, JSON.stringify([{ stage: 'Interview Scheduled', date: new Date().toISOString().split('T')[0], note: 'Self-booked by candidate' }])]
+    );
+    const istLabel = slotStart.toLocaleString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+    const msg = `${user.name} self-booked an interview for ${app.job_title} (${app.company}) at ${istLabel} IST.`;
+    await insertNotification(win.recruiter_id, 'Interview Self-Booked', msg, 'info');
+    emitEvent({ type: 'application_update', title: 'Interview Self-Booked', message: msg, targetUserId: win.recruiter_id, data: { slotId } });
+    res.status(201).json({ success: true, slotId, scheduledAt: slotStart.toISOString(), durationMinutes: win.slot_minutes });
+  } catch (error: any) {
+    console.error('window book failed:', error.message);
+    res.status(500).json({ error: 'Failed to book the slot.' });
+  }
+});
+
+// ── RECRUITER TEAMS (job collaborators) ─────────────────────────────────────
+router.post('/jobs/:jobId/collaborators', requireAuth, async (req: Request, res: Response) => {
+  const { email } = req.body || {};
+  if (!email || !String(email).includes('@')) return res.status(400).json({ error: 'A valid teammate email is required.' });
+  try {
+    const job = await requireJobOwner(req, res);
+    if (!job) return;
+    const teammate = await query(`SELECT id, name FROM users WHERE LOWER(email) = LOWER($1)`, [String(email).trim()]);
+    if (teammate.rows.length === 0) return res.status(404).json({ error: 'No S.P.A.R.K. account with that email.' });
+    if (teammate.rows[0].id === job.posted_by) return res.status(409).json({ error: 'That user already owns this posting.' });
+    await query(
+      `INSERT INTO job_collaborators (job_id, user_id, added_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [job.id, teammate.rows[0].id, (req as any).user.sub]
+    );
+    res.json({ success: true, added: teammate.rows[0].name });
+  } catch (error: any) {
+    console.error('collaborator add failed:', error.message);
+    res.status(500).json({ error: 'Failed to add the collaborator.' });
+  }
+});
+
+// ── CALENDAR SUBSCRIPTION (read-only per-student feed) ─────────────────────
+router.get('/me/calendar-token', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const r = await query(`SELECT cal_feed_token FROM users WHERE id = $1`, [user.sub]);
+    let token = r.rows[0]?.cal_feed_token;
+    if (!token) {
+      token = crypto.randomBytes(24).toString('hex');
+      await query(`UPDATE users SET cal_feed_token = $2 WHERE id = $1`, [user.sub, token]);
+    }
+    res.json({ success: true, url: `/api/calendar/${token}.ics` });
+  } catch (error: any) {
+    console.error('calendar token failed:', error.message);
+    res.status(500).json({ error: 'Failed to load the calendar feed.' });
+  }
+});
+
+router.post('/me/calendar-token/rotate', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const token = crypto.randomBytes(24).toString('hex');
+    await query(`UPDATE users SET cal_feed_token = $2 WHERE id = $1`, [user.sub, token]);
+    res.json({ success: true, url: `/api/calendar/${token}.ics` });
+  } catch (error: any) {
+    console.error('calendar rotate failed:', error.message);
+    res.status(500).json({ error: 'Failed to rotate the calendar token.' });
+  }
+});
+
+// Unauthenticated (token-in-URL) feed — safe: token is a 192-bit secret scoped
+// to read-only interview data for one student; rotate to revoke.
+router.get('/calendar/:token.ics', async (req: Request, res: Response) => {
+  try {
+    const u = await query(`SELECT id FROM users WHERE cal_feed_token = $1`, [req.params.token]);
+    if (u.rows.length === 0) return res.status(404).json({ error: 'Invalid calendar token.' });
+    const slots = await query(
+      `SELECT s.id, s.scheduled_at, s.duration_minutes, s.mode, s.meeting_url, s.notes,
+              j.title AS job_title, j.company
+         FROM interview_slots s JOIN jobs j ON j.id = s.job_id
+        WHERE s.student_id = (SELECT id FROM students WHERE user_id = $1)
+          AND s.status = 'scheduled'
+        ORDER BY s.scheduled_at ASC`,
+      [u.rows[0].id]
+    );
+    const lines = [
+      'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//S.P.A.R.K.//Interview Feed//EN', 'CALSCALE:GREGORIAN',
+      'X-WR-CALNAME:S.P.A.R.K. Interviews', 'METHOD:PUBLISH',
+    ];
+    for (const s of slots.rows) {
+      const start = new Date(s.scheduled_at);
+      const end = new Date(start.getTime() + (s.duration_minutes || 45) * 60_000);
+      lines.push(
+        'BEGIN:VEVENT',
+        `UID:${s.id}@interviews.spark`,
+        `DTSTAMP:${icsBasicUtcTime(new Date().toISOString())}`,
+        `DTSTART:${icsBasicUtcTime(start.toISOString())}`,
+        `DTEND:${icsBasicUtcTime(end.toISOString())}`,
+        `SUMMARY:${icsEscapeText(`Interview — ${s.job_title} @ ${s.company}`)}`,
+        `DESCRIPTION:${icsEscapeText([s.meeting_url ? `Join: ${s.meeting_url}` : '', s.notes ? `Notes: ${s.notes}` : ''].filter(Boolean).join('\n'))}`,
+        `LOCATION:${icsEscapeText(s.meeting_url || s.mode || 'Online')}`,
+        'END:VEVENT'
+      );
+    }
+    lines.push('END:VCALENDAR');
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.send(lines.join('\r\n') + '\r\n');
+  } catch (error: any) {
+    console.error('calendar feed failed:', error.message);
+    res.status(500).json({ error: 'Failed to build the feed.' });
+  }
+});
+
+// ── Signed resume download: HMAC link, 10-minute expiry, recruiter-only ────
+router.get('/students/:id/resume-url', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const r = await query(`SELECT resume_path, resume_uploaded_at FROM students WHERE id = $1`, [req.params.id]);
+    if (r.rows.length === 0 || !r.rows[0].resume_path) {
+      return res.status(404).json({ error: 'No resume on file for this student.' });
+    }
+    const expires = Date.now() + 10 * 60_000;
+    const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-secret').update(`${req.params.id}:${expires}`).digest('hex').slice(0, 32);
+    res.json({ success: true, url: `/api/students/${req.params.id}/resume?expires=${expires}&sig=${sig}`, expiresInMinutes: 10 });
+  } catch (error: any) {
+    console.error('resume-url failed:', error.message);
+    res.status(500).json({ error: 'Failed to create the resume link.' });
+  }
+});
+
+router.get('/students/:id/resume', async (req: Request, res: Response) => {
+  const { expires, sig } = req.query as { expires?: string; sig?: string };
+  const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-secret').update(`${req.params.id}:${expires}`).digest('hex').slice(0, 32);
+  if (!expires || !sig || sig !== expected || Number(expires) < Date.now()) {
+    return res.status(403).json({ error: 'This resume link has expired. Request a fresh one.' });
+  }
+  try {
+    const r = await query(`SELECT resume_path, resume_name FROM students WHERE id = $1`, [req.params.id]);
+    if (r.rows.length === 0 || !r.rows[0].resume_path) {
+      return res.status(404).json({ error: 'Resume not found.' });
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${(r.rows[0].resume_name || 'resume').replace(/["\r\n]/g, '')}"`);
+    res.sendFile(r.rows[0].resume_path);
+  } catch (error: any) {
+    console.error('resume download failed:', error.message);
+    res.status(500).json({ error: 'Failed to serve the resume.' });
+  }
+});
+
 // ── Interview Schedule board (owner-only): every slot across own postings ──
 router.get('/recruiter/interview-slots', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -1514,6 +2115,7 @@ router.get('/recruiter/interview-slots', requireAuth, async (req: Request, res: 
          JOIN jobs j ON j.id = s.job_id
          LEFT JOIN applications a ON a.id = s.application_id
         WHERE j.posted_by = $1
+           OR j.id IN (SELECT job_id FROM job_collaborators WHERE user_id = $1)
         ORDER BY (s.status = 'scheduled') DESC, s.scheduled_at ASC`,
       [recruiter.sub]
     );
@@ -1560,6 +2162,7 @@ router.get('/recruiter/funnel', requireAuth, async (req: Request, res: Response)
          FROM jobs j
          LEFT JOIN applications a ON a.job_id = j.id
         WHERE j.posted_by = $1
+           OR j.id IN (SELECT job_id FROM job_collaborators WHERE user_id = $1)
         GROUP BY j.id, j.title, j.company
         ORDER BY applied DESC, j.title ASC`,
       [recruiter.sub]
@@ -1569,6 +2172,7 @@ router.get('/recruiter/funnel', requireAuth, async (req: Request, res: Response)
          FROM applications a
          JOIN jobs j ON j.id = a.job_id
         WHERE j.posted_by = $1
+           OR j.id IN (SELECT job_id FROM job_collaborators WHERE user_id = $1)
         GROUP BY 1, 2
         ORDER BY 2 ASC`,
       [recruiter.sub]
@@ -1630,6 +2234,7 @@ router.get('/applications', async (req: Request, res: Response) => {
         `SELECT a.* FROM applications a
          JOIN jobs j ON j.id = a.job_id
          WHERE j.posted_by = $1
+            OR j.id IN (SELECT job_id FROM job_collaborators WHERE user_id = $1)
          ORDER BY a.applied_date DESC`,
         [auth.sub]
       );
@@ -1691,25 +2296,19 @@ router.post('/applications', async (req: Request, res: Response) => {
       ]
     );
 
-    // Create a real-time notification
-    await query(
-      `INSERT INTO notifications (id, user_id, title, message, type)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [
-        `notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, 
-        studentId,
-        'Application Submitted',
-        `Your application for ${jobTitle} at ${company} was submitted. Current stage: ${initialStatus}`,
-        'info',
-      ]
-    );
+    // Create a real-time notification — resolve the student's linked login
+    // account; notifications.user_id references users(id), so a bare student
+    // id must never be written (it would violate the FK or be unreadable).
+    const linkedUserRes = await query(`SELECT user_id FROM students WHERE id = $1`, [studentId]).catch(() => ({ rows: [] as any[] }));
+    const notifyUserId: string | null = linkedUserRes.rows[0]?.user_id || await resolveStudentUserId(studentId);
+    await insertNotification(notifyUserId, 'Application Submitted', `Your application for ${jobTitle} at ${company} was submitted. Current stage: ${initialStatus}`, 'info');
 
     // Push live update to the student's open browser sessions
-    emitEvent({
+    if (notifyUserId) emitEvent({
       type: 'application_update',
       title: 'Application Submitted',
       message: `Your application for ${jobTitle} at ${company} is now: ${initialStatus}`,
-      targetUserId: studentId,
+      targetUserId: notifyUserId,
       data: { jobId, status: initialStatus },
     });
 
@@ -2072,12 +2671,79 @@ router.get('/analytics', async (req: Request, res: Response) => {
 });
 
 router.post('/copilot', async (req: Request, res: Response) => {
-  const { query: userQuery, apiKey } = req.body;
+  const { query: userQuery } = req.body;
+  // Abuse guard: the server's GEMINI_API_KEY is used — client keys are ignored
+  // so users can never be phished for their own credentials.
+  const rl = checkRateLimit(`copilot:${clientIpOf(req)}`, 20);
+  if (!rl.allowed) {
+    return res.status(429).json({ error: 'Copilot rate limit reached. Try again shortly.' });
+  }
   try {
-    const answer = await askCopilot(userQuery || '', apiKey);
+    const answer = await askCopilot(userQuery || '', process.env.GEMINI_API_KEY);
     res.json({ answer });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── TalentSearch: real direct interview invitation (persisted + notified) ───
+router.post('/talent/invite', requireAuth, async (req: Request, res: Response) => {
+  const { studentId, message } = req.body || {};
+  if (!studentId || typeof studentId !== 'string') {
+    return res.status(400).json({ error: 'studentId is required.' });
+  }
+  try {
+    const recruiter = (req as any).user;
+    const stu = await query(`SELECT id, name, email, user_id FROM students WHERE id = $1`, [studentId]);
+    if (stu.rows.length === 0) {
+      return res.status(404).json({ error: 'Student not found.' });
+    }
+    const student = stu.rows[0];
+    const note = (message && typeof message === 'string' ? message : '').slice(0, 500);
+    const uid: string | null = student.user_id || await resolveStudentUserId(studentId);
+    const title = 'Direct Interview Invitation';
+    const msg = `${recruiter.name} (${recruiter.email}) invites you to an interview.${note ? ` Note: ${note}` : ''} Open your dashboard to respond.`;
+    await insertNotification(uid, title, msg, 'success');
+    if (uid) emitEvent({ type: 'application_update', title, message: msg, targetUserId: uid, data: { from: recruiter.sub } });
+    await query(`INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'TALENT_INVITE', $2)`,
+      [recruiter.email, JSON.stringify({ studentId, note })]).catch(() => {});
+    res.json({ success: true, studentId, studentName: student.name, notifiedUserId: uid || null });
+  } catch (error: any) {
+    console.error('talent invite failed:', error.message);
+    res.status(500).json({ error: 'Failed to send the invitation.' });
+  }
+});
+
+// ── NIRF-format registry export (real CSV from students + assessments) ──────
+router.get('/college/nirf-export', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT s.name, s.email, s.college, s.branch, s.semester, s.cgpa, s.graduation_year,
+              s.target_role, s.readiness_score, s.assessment_completed,
+              count(a.id)::int AS applications,
+              count(a.id) FILTER (WHERE a.status = 'Offer Extended')::int AS offers
+         FROM students s
+         LEFT JOIN applications a ON a.student_id = s.id
+        GROUP BY s.id
+        ORDER BY s.branch ASC, s.readiness_score DESC`
+    );
+    const escape = (v: any) => {
+      const s = String(v ?? '');
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = 'Name,Email,College,Branch,Semester,CGPA,Graduation Year,Target Track,AI Readiness %,Assessment Completed,Applications,Offers';
+    const lines = result.rows.map(r => [
+      r.name, r.email, r.college, r.branch, r.semester, r.cgpa, r.graduation_year,
+      r.target_role, r.readiness_score ?? '', r.assessment_completed ? 'Yes' : 'No',
+      r.applications, r.offers,
+    ].map(escape).join(','));
+    const csv = [header, ...lines].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="nirf-student-registry-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csv);
+  } catch (error: any) {
+    console.error('NIRF export failed:', error.message);
+    res.status(500).json({ error: 'Failed to build the NIRF export.' });
   }
 });
 
@@ -2262,15 +2928,52 @@ router.post('/register', async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
     try {
-      const userRes = await client.query(
-        `INSERT INTO users (id, name, email, role, avatar, password_hash)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role,
-           avatar = EXCLUDED.avatar,
-           password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)
-         RETURNING *`,
-        [userId, name.trim(), normalizedEmail, role || 'student', avatar, passwordHash]
-      );
+      
+        let verificationStatus = 'pending';
+        
+        if (role === 'student') {
+          if (normalizedEmail.endsWith('.edu.in') || normalizedEmail.endsWith('.ac.in')) {
+            verificationStatus = 'verified';
+          } else {
+            verificationStatus = 'pending_college_approval';
+          }
+        } else if (role === 'college') {
+          const aisheRegex = /^[CU]-[0-9]{4,6}$/i;
+          const { aisheCode, officialDomain } = req.body;
+          if (aisheCode && aisheRegex.test(aisheCode) && officialDomain && normalizedEmail.endsWith(officialDomain.toLowerCase())) {
+            verificationStatus = 'verified';
+          } else {
+            verificationStatus = 'pending_admin_approval';
+          }
+        } else if (role === 'industry') {
+          const blockedDomains = ['@gmail.com', '@yahoo.com', '@outlook.com', '@hotmail.com'];
+          if (blockedDomains.some(d => normalizedEmail.endsWith(d))) {
+             await client.query('ROLLBACK');
+             return res.status(400).json({ error: 'Free email domains are blocked for Industry registration.' });
+          }
+          const { cinGstin } = req.body;
+          const cinRegex = /^[LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}$/i;
+          const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/i;
+          if (cinGstin && (cinRegex.test(cinGstin) || gstinRegex.test(cinGstin))) {
+            verificationStatus = 'verified';
+          } else {
+            verificationStatus = 'pending_admin_approval';
+          }
+        } else if (role === 'alumni') {
+          verificationStatus = 'pending_college_approval';
+        }
+
+        const userRes = await client.query(
+          `INSERT INTO users (id, name, email, role, avatar, password_hash, verification_status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role,
+             avatar = EXCLUDED.avatar,
+             password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash),
+             verification_status = EXCLUDED.verification_status
+           RETURNING *`,
+          [userId, name.trim(), normalizedEmail, role || 'student', avatar, passwordHash, verificationStatus]
+        );
+
       // The row's real id (on re-registration the existing id is preserved)
       const effectiveUserId = userRes.rows[0].id;
 
@@ -2347,7 +3050,24 @@ router.post('/register', async (req: Request, res: Response) => {
           ]
         );
       }
-      
+
+      if (role === 'college') {
+        const instId = `inst-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        await client.query(
+          `INSERT INTO institutions (id, user_id, aishe_code, official_domain)
+           VALUES ($1, $2, $3, $4)`,
+          [instId, effectiveUserId, req.body.aisheCode || null, req.body.officialDomain || null]
+        );
+      }
+
+      if (role === 'industry') {
+        const indId = `ind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        await client.query(
+          `INSERT INTO industries (id, user_id, cin_gstin)
+           VALUES ($1, $2, $3)`,
+          [indId, effectiveUserId, req.body.cinGstin || null]
+        );
+      }
 
       await client.query(
         `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
@@ -2616,7 +3336,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
   try {
     const userRes = await query(
-      `SELECT id, name, email, role, avatar, password_hash FROM users WHERE LOWER(email) = $1`,
+      `SELECT id, name, email, role, avatar, password_hash, COALESCE(token_version, 0) AS token_version FROM users WHERE LOWER(email) = $1`,
       [normalizedEmail]
     );
     const user = userRes.rows[0];
@@ -2647,11 +3367,14 @@ router.post('/login', async (req: Request, res: Response) => {
       [user.id, 'LOGIN_SUCCESS', JSON.stringify({ timestamp: new Date() })]
     );
 
-    const token = signToken({ sub: user.id, email: user.email, role: user.role, name: user.name });
+    const ver = user.token_version ?? 0;
+    const token = signToken({ sub: user.id, email: user.email, role: user.role, name: user.name, ver });
+    const refreshToken = signRefreshToken(user.id);
 
     res.json({
       success: true,
       token,
+      refreshToken,
       user: {
         id: user.id,
         name: user.name,
@@ -2667,9 +3390,58 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 });
 
+// ── Refresh token rotation: exchange a valid refresh token for a new session ─
+router.post('/auth/refresh', async (req: Request, res: Response) => {
+  const { refreshToken } = req.body || {};
+  const decoded = refreshToken ? verifyRefreshToken(String(refreshToken)) : null;
+  if (!decoded) {
+    return res.status(401).json({ error: 'Refresh token invalid or expired. Please sign in again.' });
+  }
+  try {
+    const r = await query('SELECT id, email, role, name, token_version FROM users WHERE id = $1', [decoded.sub]);
+    const user = r.rows[0];
+    if (!user) return res.status(401).json({ error: 'Account no longer exists.' });
+    const ver = user.token_version ?? 0;
+    // Rotation: a new refresh token is issued with every refresh so a stolen
+    // one has limited life; revocation (bump) kills the whole family.
+    res.json({
+      success: true,
+      token: signToken({ sub: user.id, email: user.email, role: user.role, name: user.name, ver }),
+      refreshToken: signRefreshToken(user.id),
+      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+    });
+  } catch (error: any) {
+    console.error('refresh error:', error.message);
+    res.status(500).json({ error: 'Refresh failed.' });
+  }
+});
+
+// ── Server-side logout: bump token_version so every issued JWT dies now ─────
+router.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    await query(`UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = $1`, [user.sub]);
+    await query(`INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'LOGOUT', $2)`, [user.email, JSON.stringify({ at: new Date() })]).catch(() => {});
+    res.json({ success: true, message: 'Signed out on this device. All existing tokens are revoked.' });
+  } catch (error: any) {
+    console.error('logout error:', error.message);
+    res.status(500).json({ error: 'Logout failed.' });
+  }
+});
+
 // ==========================================
 // 12. DATABASE ADMIN EXPLORER (BROWSER GUI)
 // ==========================================
+const GENERIC_ADMIN_DELETE_TABLES = [
+  'assessments',
+  'roadmaps',
+  'jobs',
+  'applications',
+  'mous',
+  'problem_statements',
+  'otp_verifications'
+];
+
 const ALLOWED_ADMIN_TABLES = [
   'users',
   'students',
@@ -2792,11 +3564,11 @@ router.put('/admin/table-data/:tableName/:id', requireAuth, async (req: Request,
 });
 
 // Delete a row from a table (Browser Admin GUI)
-router.delete('/admin/table-data/:tableName/:id', requireAuth, async (req: Request, res: Response) => {
+router.delete('/admin/table-data/:tableName/:id', requireAdmin, async (req: Request, res: Response) => {
   const tableName = String(req.params.tableName);
   const id = String(req.params.id);
-  if (!ALLOWED_ADMIN_TABLES.includes(tableName)) {
-    return res.status(400).json({ error: 'Invalid or restricted table.' });
+  if (!GENERIC_ADMIN_DELETE_TABLES.includes(tableName)) {
+    return res.status(400).json({ error: 'Use the dedicated account-deletion endpoint for users and students.' });
   }
 
   try {
@@ -2808,6 +3580,91 @@ router.delete('/admin/table-data/:tableName/:id', requireAuth, async (req: Reque
   } catch (error: any) {
     console.error(`Error deleting from ${tableName}:`, error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
+// DELETE COMPLETE USER / STUDENT ACCOUNT
+// ==========================================
+router.delete('/admin/users/:userId', requireAdmin, async (req: Request, res: Response) => {
+  const admin = (req as any).user;
+  const userId = String(req.params.userId);
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required.' });
+  }
+
+  const client = await pool.connect();
+  let deletedUser: any = null;
+  let resumePath: string | null = null;
+
+  try {
+    await client.query('BEGIN');
+
+    const userResult = await client.query(
+      `SELECT u.id, u.email, u.name, u.role, s.id AS student_id, s.resume_path
+       FROM users u LEFT JOIN students s ON s.user_id = u.id
+       WHERE u.id = $1 FOR UPDATE OF u`,
+      [userId]
+    );
+
+    if (userResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    deletedUser = userResult.rows[0];
+    resumePath = deletedUser.resume_path || null;
+    const studentId = deletedUser.student_id;
+
+    if (studentId) {
+      await client.query(`DELETE FROM mentorship_messages WHERE room_id IN (SELECT id FROM mentorship_rooms WHERE student_id = $1)`, [studentId]);
+      await client.query(`DELETE FROM mentorship_rooms WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM mentorship_requests WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM verification_reviews WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM digital_badges WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM applications WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM assessments WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM roadmaps WHERE student_id = $1`, [studentId]);
+      await client.query(`DELETE FROM students WHERE id = $1`, [studentId]);
+    }
+
+    await client.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]);
+    await client.query(`DELETE FROM otp_verifications WHERE LOWER(email) = LOWER($1)`, [deletedUser.email]);
+
+    const deleteUserResult = await client.query(`DELETE FROM users WHERE id = $1 RETURNING id, email, name, role`, [userId]);
+    if (deleteUserResult.rows.length === 0) {
+      throw new Error('User disappeared before deletion completed.');
+    }
+
+    await client.query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
+      [admin.email || admin.sub, 'DELETE_USER_ACCOUNT', JSON.stringify({
+        deletedUserId: userId, deletedEmail: deletedUser.email, deletedName: deletedUser.name,
+        deletedRole: deletedUser.role, deletedStudentId: studentId || null, deletedAt: new Date().toISOString()
+      })]
+    );
+
+    await client.query('COMMIT');
+
+    if (resumePath) {
+      const fsPromises = require('fs').promises;
+      try {
+        await fsPromises.unlink(resumePath);
+      } catch (fileError: any) {
+        if (fileError.code !== 'ENOENT') {
+          console.warn('User deleted but resume file could not be removed:', fileError.message);
+        }
+      }
+    }
+
+    return res.json({ success: true, message: 'User account and associated student data deleted successfully.', deleted: { userId, email: deletedUser.email, studentId: studentId || null } });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Delete user account error:', error);
+    return res.status(500).json({ error: 'Account deletion failed. No changes were committed.' });
+  } finally {
+    client.release();
   }
 });
 

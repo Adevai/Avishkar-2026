@@ -218,6 +218,20 @@ export async function initDatabase() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Keep fresh installs consistent with the production DB: notification rows
+    // may only reference real login accounts (students without a linked user
+    // are notified via SSE only).
+    await client.query(
+      `DO $$ BEGIN
+         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'notifications_user_id_fkey') THEN
+           BEGIN
+             ALTER TABLE notifications ADD CONSTRAINT notifications_user_id_fkey
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+           EXCEPTION WHEN others THEN NULL; -- pre-existing orphan rows
+           END;
+         END IF;
+       END $$;`
+    );
 
     // 10. Audit Logs Table
     await client.query(`
@@ -363,6 +377,81 @@ export async function initDatabase() {
       ALTER TABLE interview_slots ADD COLUMN IF NOT EXISTS reminder_2h_sent_at TIMESTAMP WITH TIME ZONE;
     `);
 
+    // ── Production hardening & product expansion (idempotent) ──
+    // Token revocation: bump to invalidate all existing JWTs for a user.
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 0;`);
+    // Per-student secret token for the read-only calendar subscription feed.
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cal_feed_token VARCHAR(64);`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cal_token ON users(cal_feed_token) WHERE cal_feed_token IS NOT NULL;`);
+    // Interview slots can originate from a self-scheduling window.
+    await client.query(`ALTER TABLE interview_slots ADD COLUMN IF NOT EXISTS window_id VARCHAR(64);`);
+
+    // Offer management: real offer lifecycle beyond the status string.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS offers (
+        id VARCHAR(64) PRIMARY KEY,
+        application_id VARCHAR(64) NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+        job_id VARCHAR(64) NOT NULL,
+        student_id VARCHAR(64) NOT NULL,
+        recruiter_id VARCHAR(64) NOT NULL,
+        salary_text VARCHAR(255),
+        joining_date DATE,
+        deadline DATE,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',   -- pending | accepted | declined
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        responded_at TIMESTAMP WITH TIME ZONE
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_offers_application ON offers(application_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_offers_student ON offers(student_id);`);
+
+    // Student self-scheduling: recruiter publishes windows, students book slots.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS interview_windows (
+        id VARCHAR(64) PRIMARY KEY,
+        job_id VARCHAR(64) NOT NULL,
+        recruiter_id VARCHAR(64) NOT NULL,
+        start_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        end_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        slot_minutes INT DEFAULT 45,
+        capacity INT DEFAULT 1,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_windows_job ON interview_windows(job_id);`);
+
+    // Recruiter teams: collaborators can manage a posting they did not post.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS job_collaborators (
+        job_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(64) NOT NULL,
+        added_by VARCHAR(64) NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (job_id, user_id)
+      );
+    `);
+
+    // Durable email outbox: senders enqueue; the worker retries with backoff.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_outbox (
+        id VARCHAR(64) PRIMARY KEY,
+        payload JSONB NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',   -- pending | sent | failed
+        attempts INT DEFAULT 0,
+        next_attempt_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        last_error TEXT,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        sent_at TIMESTAMP WITH TIME ZONE
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_outbox_due ON email_outbox(status, next_attempt_at);`);
+
+    // Resume files persist to local disk (uploads/resumes); the signed URL
+    // family uses resume_uploaded_at for expiry. Swap for S3 later by
+    // replacing the disk write in the upload route only.
+    await client.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS resume_path TEXT;`);
+    await client.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS resume_uploaded_at TIMESTAMP WITH TIME ZONE;`);
+
     // Server-side institution verification flag (distinct from client-side id_card_verified)
     await client.query(`
       ALTER TABLE students ADD COLUMN IF NOT EXISTS institution_verified BOOLEAN DEFAULT FALSE;
@@ -471,7 +560,84 @@ export async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_ftj_alumni ON fast_track_jobs(alumni_id);
     `);
 
-    await client.query('COMMIT');
+    
+      
+    await client.query(`
+      -- FOREIGN KEY CASCADE MIGRATIONS ADDED HERE
+      UPDATE students s SET user_id = NULL WHERE s.user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = s.user_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_students_user_id_unique ON students(user_id) WHERE user_id IS NOT NULL;
+      ALTER TABLE students DROP CONSTRAINT IF EXISTS students_user_id_fkey;
+      ALTER TABLE students ADD CONSTRAINT students_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+      DELETE FROM assessments a WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = a.student_id);
+      ALTER TABLE assessments DROP CONSTRAINT IF EXISTS assessments_student_id_fkey;
+      ALTER TABLE assessments ADD CONSTRAINT assessments_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM roadmaps r WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = r.student_id);
+      ALTER TABLE roadmaps DROP CONSTRAINT IF EXISTS roadmaps_student_id_fkey;
+      ALTER TABLE roadmaps ADD CONSTRAINT roadmaps_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM applications a WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = a.student_id);
+      ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_student_id_fkey;
+      ALTER TABLE applications ADD CONSTRAINT applications_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM digital_badges b WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = b.student_id);
+      ALTER TABLE digital_badges DROP CONSTRAINT IF EXISTS digital_badges_student_id_fkey;
+      ALTER TABLE digital_badges ADD CONSTRAINT digital_badges_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM verification_reviews v WHERE v.student_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM students s WHERE s.id = v.student_id);
+      ALTER TABLE verification_reviews DROP CONSTRAINT IF EXISTS verification_reviews_student_id_fkey;
+      ALTER TABLE verification_reviews ADD CONSTRAINT verification_reviews_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM mentorship_requests m WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = m.student_id);
+      ALTER TABLE mentorship_requests DROP CONSTRAINT IF EXISTS mentorship_requests_student_id_fkey;
+      ALTER TABLE mentorship_requests ADD CONSTRAINT mentorship_requests_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      DELETE FROM mentorship_messages mm WHERE NOT EXISTS (SELECT 1 FROM mentorship_rooms mr WHERE mr.id = mm.room_id);
+      DELETE FROM mentorship_rooms mr WHERE NOT EXISTS (SELECT 1 FROM students s WHERE s.id = mr.student_id);
+      ALTER TABLE mentorship_rooms DROP CONSTRAINT IF EXISTS mentorship_rooms_student_id_fkey;
+      ALTER TABLE mentorship_rooms ADD CONSTRAINT mentorship_rooms_student_id_fkey FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE;
+
+      ALTER TABLE mentorship_messages DROP CONSTRAINT IF EXISTS mentorship_messages_room_id_fkey;
+      ALTER TABLE mentorship_messages ADD CONSTRAINT mentorship_messages_room_id_fkey FOREIGN KEY (room_id) REFERENCES mentorship_rooms(id) ON DELETE CASCADE;
+
+      DELETE FROM notifications n WHERE n.user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = n.user_id);
+      ALTER TABLE notifications DROP CONSTRAINT IF EXISTS notifications_user_id_fkey;
+      ALTER TABLE notifications ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+      CREATE INDEX IF NOT EXISTS idx_assessments_student_id ON assessments(student_id);
+      CREATE INDEX IF NOT EXISTS idx_roadmaps_student_id ON roadmaps(student_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_student_id ON applications(student_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_verification_reviews_student_id ON verification_reviews(student_id);
+      CREATE INDEX IF NOT EXISTS idx_mentorship_requests_student_id ON mentorship_requests(student_id);
+      CREATE INDEX IF NOT EXISTS idx_mentorship_rooms_student_id ON mentorship_rooms(student_id);
+      
+      -- Verification Schema Extensions
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status VARCHAR(32) DEFAULT 'pending';
+
+      CREATE TABLE IF NOT EXISTS institutions (
+          id VARCHAR(64) PRIMARY KEY,
+          user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+          aishe_code VARCHAR(32),
+          official_domain VARCHAR(255),
+          affiliation_document_url TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS industries (
+          id VARCHAR(64) PRIMARY KEY,
+          user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
+          cin_gstin VARCHAR(64),
+          incorporation_document_url TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      ALTER TABLE alumni ADD COLUMN IF NOT EXISTS linkedin_url VARCHAR(255);
+      ALTER TABLE alumni ADD COLUMN IF NOT EXISTS is_mentor BOOLEAN DEFAULT FALSE;
+      ALTER TABLE alumni ADD COLUMN IF NOT EXISTS mentor_tech_stack JSONB DEFAULT '[]'::jsonb;
+`);
+await client.query('COMMIT');
     console.log('✅ PostgreSQL Schema migration completed successfully!');
   } catch (err) {
     await client.query('ROLLBACK');
