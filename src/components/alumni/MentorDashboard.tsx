@@ -1,13 +1,147 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   Inbox, MessageSquare, Zap, CheckCircle2, XCircle, Loader2, Users,
-  GraduationCap, Plus, Building2, Clock, Send,
+  GraduationCap, Plus, Building2, Clock, Send, ToggleLeft, ToggleRight, Save,
 } from 'lucide-react';
 import { api } from '../../services/api';
 import { useApp } from '../../context/AppContext';
 import { MentorshipRequest } from '../../types';
 import { MentorshipChat } from './MentorshipChat';
 import { AlumniDirectory } from './AlumniDirectory';
+
+/**
+ * Enable Mentor Profile toggle — visible once the alumni record exists
+ * (college-approved). Persist company / role / tech stack and opt in or out
+ * of the mentor directory.
+ */
+const MentorProfileToggle: React.FC<{ mentorId: string; onChanged?: () => void }> = ({ mentorId, onChanged }) => {
+  const { student, setNotification } = useApp();
+  const [isMentor, setIsMentor] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [techStack, setTechStack] = useState('');
+  const [currentCompany, setCurrentCompany] = useState('');
+  const [currentRole, setCurrentRole] = useState('');
+  const [capacity, setCapacity] = useState(5);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getMyAlumniProfile(student.email || '')
+      .then(res => {
+        if (cancelled || !res.found) return;
+        const p: any = res.profile;
+        setIsMentor(!!p.isMentor);
+        setTechStack(Array.isArray(p.mentorTechStack) ? p.mentorTechStack.join(', ') : '');
+        setCurrentCompany(p.company || '');
+        setCurrentRole(p.designation || '');
+        setCapacity(p.mentorCapacity || 5);
+        setLoaded(true);
+      })
+      .catch(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [student.email]);
+
+  const save = async (nextIsMentor: boolean) => {
+    setSaving(true);
+    try {
+      const res = await api.updateMentorProfile({
+        isMentor: nextIsMentor,
+        mentorCapacity: capacity,
+        techStack: techStack.split(',').map(s => s.trim()).filter(Boolean),
+        currentCompany: currentCompany || undefined,
+        currentRole: currentRole || undefined,
+      });
+      setIsMentor(!!(res.profile?.is_mentor ?? nextIsMentor));
+      setNotification(nextIsMentor ? 'Mentor profile enabled — students can now discover you.' : 'Mentor profile paused.');
+      onChanged?.();
+    } catch (err: any) {
+      setNotification(err.message || 'Failed to update the mentor profile.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!loaded) return null;
+
+  return (
+    <div className="premium-card p-5">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <h3 className="font-bold text-ink-900 flex items-center gap-2">
+            {isMentor ? <ToggleRight className="w-5 h-5 text-emerald-600" /> : <ToggleLeft className="w-5 h-5 text-ink-300" />}
+            Mentor Profile
+          </h3>
+          <p className="text-xs text-ink-500 mt-0.5">
+            {isMentor
+              ? 'You are listed in the verified mentor directory.'
+              : 'Enable to appear in the verified mentor directory and receive student requests.'}
+          </p>
+        </div>
+        <button
+          onClick={() => save(!isMentor)}
+          disabled={saving}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all disabled:opacity-50 ${
+            isMentor ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-ink-900 hover:bg-ink-800 text-white'
+          }`}
+        >
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : isMentor ? 'Pause Mentoring' : 'Enable Mentor Profile'}
+        </button>
+      </div>
+      {isMentor && (
+        <div className="mt-4 grid sm:grid-cols-2 gap-3">
+          <div>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Current Company</label>
+            <input
+              value={currentCompany}
+              onChange={e => setCurrentCompany(e.target.value)}
+              className="mt-1 w-full px-3 py-2 text-xs border border-ink-900/10 rounded-xl bg-white"
+              placeholder="e.g. Google"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Current Role</label>
+            <input
+              value={currentRole}
+              onChange={e => setCurrentRole(e.target.value)}
+              className="mt-1 w-full px-3 py-2 text-xs border border-ink-900/10 rounded-xl bg-white"
+              placeholder="e.g. Senior Backend Engineer"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Tech Stack (comma-separated)</label>
+            <input
+              value={techStack}
+              onChange={e => setTechStack(e.target.value)}
+              className="mt-1 w-full px-3 py-2 text-xs border border-ink-900/10 rounded-xl bg-white"
+              placeholder="React, Kubernetes, LLMs"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-ink-500 uppercase tracking-wider">Mentee Capacity</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={capacity}
+              onChange={e => setCapacity(Number(e.target.value) || 5)}
+              className="mt-1 w-full px-3 py-2 text-xs border border-ink-900/10 rounded-xl bg-white"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <button
+              onClick={() => save(true)}
+              disabled={saving}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-ink-900/[0.06] hover:bg-ink-900/10 text-ink-800 text-xs font-bold disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              Save profile details
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 interface Room {
   id: string;
@@ -142,6 +276,14 @@ export const MentorDashboard: React.FC<{ initialSection?: string }> = ({ initial
           </button>
         ))}
       </div>
+
+      {/* Enable Mentor Profile toggle — unlocked once the college vouches the alumni record */}
+      {mentorId && (
+        <MentorProfileToggle
+          mentorId={mentorId}
+          onChanged={() => { /* requests/rooms refresh themselves via load() */ }}
+        />
+      )}
 
       {/* Identity gate: mentor profile must be resolved (university-approved) */}
       {identityState === 'loading' && section !== 'find-mentor' ? (

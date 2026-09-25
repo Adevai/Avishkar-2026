@@ -21,6 +21,7 @@ const PlacementTracker = lazy(() => import('../components/student/PlacementTrack
 const ProgressAnalytics = lazy(() => import('../components/student/ProgressAnalytics').then(m => ({ default: m.ProgressAnalytics })));
 const CollegeDashboard = lazy(() => import('../components/college/CollegeDashboard').then(m => ({ default: m.CollegeDashboard })));
 const CollegeStudentDirectory = lazy(() => import('../components/college/CollegeStudentDirectory').then(m => ({ default: m.CollegeStudentDirectory })));
+const CollegeApprovalsPanel = lazy(() => import('../components/college/CollegeApprovalsPanel').then(m => ({ default: m.CollegeApprovalsPanel })));
 const MoUManager = lazy(() => import('../components/collaboration/MoUManager').then(m => ({ default: m.MoUManager })));
 const IndustryDashboard = lazy(() => import('../components/industry/IndustryDashboard').then(m => ({ default: m.IndustryDashboard })));
 const TalentSearch = lazy(() => import('../components/industry/TalentSearch').then(m => ({ default: m.TalentSearch })));
@@ -190,10 +191,11 @@ export const Dashboard: React.FC = () => {
 
             {currentRole === 'college' && (
               <TabSuspense>
-                {(activeTab === 'overview' || activeTab === 'dept-analysis' || activeTab === 'placement-drives' || !['students', 'mous', 'alumni-desk'].includes(activeTab)) && <CollegeDashboard />}
+                {(activeTab === 'overview' || activeTab === 'dept-analysis' || activeTab === 'placement-drives' || !['students', 'mous', 'alumni-desk', 'approvals'].includes(activeTab)) && <CollegeDashboard />}
                 {activeTab === 'students' && <CollegeStudentDirectory />}
                 {activeTab === 'mous' && <MoUManager />}
                 {activeTab === 'alumni-desk' && <UniversityAlumniVerificationDesk />}
+                {activeTab === 'approvals' && <CollegeApprovalsPanel />}
               </TabSuspense>
             )}
 

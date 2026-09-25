@@ -1247,6 +1247,57 @@ async function insertNotification(userId: string | null, title: string, message:
   ).catch(() => {});
 }
 
+// ── PORTAL ROLE VERIFICATION MATRIX (shared validators) ────────────────────
+// Student: college domain + OTP auto-verify or ID-card OCR; personal mail ->
+// PENDING_COLLEGE_APPROVAL. College: AISHE code + domain match. Industry:
+// work email + CIN/GSTIN; MSME certificate fallback. Alumni: grad year +
+// enrollment + LinkedIn, approved by the college desk before mentoring.
+const FREE_EMAIL_DOMAINS = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com'];
+const CIN_REGEX = /^[LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}$/;          // 21-char MCA CIN
+const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/; // 15-char GSTIN
+const AISHE_REGEX = /^[CU]-[0-9]{4,6}$/;                                       // e.g. C-33915
+const OFFICIAL_TLD_SUFFIXES = ['.ac.in', '.edu.in', '.ernet.in', '.gov.in', '.nic.in', '.edu', '.ac.uk'];
+
+const emailDomainOf = (email: string) => (email.includes('@') ? email.split('@')[1].toLowerCase() : '');
+const emailLooksInstitutional = (domain: string) =>
+  OFFICIAL_TLD_SUFFIXES.some(sfx => domain.endsWith(sfx));
+
+function validateAisheCode(code: string): { isValid: boolean; error?: string } {
+  const c = String(code || '').trim().toUpperCase();
+  if (!c) return { isValid: false, error: 'AISHE code is required (format C-12345 or U-12345, e.g. C-33915).' };
+  if (!AISHE_REGEX.test(c)) {
+    return { isValid: false, error: 'Invalid AISHE code format — it must look like C-33915 (College) or U-12345 (University): a C/U prefix, a hyphen, then 4-6 digits.' };
+  }
+  return { isValid: true };
+}
+
+function validateCinOrGstin(value: string): { isValid: boolean; kind: 'CIN' | 'GSTIN' | null; error?: string } {
+  const v = String(value || '').trim().toUpperCase();
+  if (!v) return { isValid: false, kind: null, error: 'CIN or GSTIN is required for Industry registration.' };
+  if (CIN_REGEX.test(v)) return { isValid: true, kind: 'CIN' };
+  if (GSTIN_REGEX.test(v)) return { isValid: true, kind: 'GSTIN' };
+  return {
+    isValid: false,
+    kind: null,
+    error: 'Invalid CIN/GSTIN. CIN is 21 characters (e.g. L12345MH2020PLC123456); GSTIN is 15 characters (e.g. 27AAPFU0939F1ZV). Startups without one may upload an Udyam/Incorporation certificate instead.',
+  };
+}
+
+// An email matches an organisation when its domain equals (or is a subdomain
+// of) the official website host — coep.ac.in mail matches www.coep.ac.in.
+function emailDomainMatchesSite(email: string, site: string): boolean {
+  if (!site) return false;
+  const host = String(site).trim().toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .split(/[/?#]/)[0];
+  if (!host || !host.includes('.')) return false;
+  const dom = emailDomainOf(email);
+  return !!dom && (dom === host || dom.endsWith(`.${host}`) || host.endsWith(`.${dom}`));
+}
+
+const LINKEDIN_PROFILE_REGEX = /^https:\/\/(www\.)?linkedin\.com\/(in|pub)\/[A-Za-z0-9_%-]{3,100}\/?$/i;
+
 function notifyJobApplicants(jobId: string, jobTitle: string, company: string, title: string, message: string) {
   // Non-blocking: informs every applicant on status change via notification + SSE.
   (async () => {
@@ -2930,36 +2981,93 @@ router.post('/register', async (req: Request, res: Response) => {
     try {
       
         let verificationStatus = 'pending';
-        
+        let studentEnrollment: string | null = null;
+        let studentPrn: string | null = null;
+
         if (role === 'student') {
-          if (normalizedEmail.endsWith('.edu.in') || normalizedEmail.endsWith('.ac.in')) {
+          // Auto-verify when the email belongs to the selected college's
+          // official domain (e.g. @coep.ac.in) or any institutional .ac.in /
+          // .edu.in domain; personal mail (Gmail etc.) lands in the college's
+          // TPO approval queue. The OTP gate above already proved email
+          // ownership, so a domain match is a real instant verification.
+          const domain = emailDomainOf(normalizedEmail);
+          const selectedCollege = String(college || '').trim();
+          // (a) The email domain belongs to a VERIFIED institution registered
+          // on this platform (its official website domain) — strongest signal.
+          const collegeDomainRow = await client.query(
+            `SELECT 1 FROM institutions i JOIN users u ON u.id = i.user_id
+              WHERE i.official_domain IS NOT NULL AND u.verification_status = 'verified'
+                AND ($1 = i.official_domain OR $1 LIKE '%.' || i.official_domain)
+              LIMIT 1`,
+            [domain]
+          );
+          const domainMatchesRegisteredCollege = collegeDomainRow.rows.length > 0;
+          // (b) Institutional TLD (.ac.in / .edu.in) AND the selected college
+          // matches the accredited institutions registry.
+          const registryMatch = selectedCollege ? verifyInstitutionServer(selectedCollege) : null;
+          const institutionalTld = emailLooksInstitutional(domain);
+          if (domainMatchesRegisteredCollege || (institutionalTld && registryMatch?.level === 'verified')) {
             verificationStatus = 'verified';
           } else {
             verificationStatus = 'pending_college_approval';
           }
+          studentEnrollment = (req.body.enrollmentNumber && String(req.body.enrollmentNumber).trim()) || null;
+          studentPrn = (req.body.prn && String(req.body.prn).trim()) || null;
         } else if (role === 'college') {
-          const aisheRegex = /^[CU]-[0-9]{4,6}$/i;
-          const { aisheCode, officialDomain } = req.body;
-          if (aisheCode && aisheRegex.test(aisheCode) && officialDomain && normalizedEmail.endsWith(officialDomain.toLowerCase())) {
-            verificationStatus = 'verified';
-          } else {
-            verificationStatus = 'pending_admin_approval';
+          // AISHE format check + the email domain must match the submitted
+          // official website hostname. Failure is a hard 400 (invalid data),
+          // not a silent queue entry — garbage must not become pending rows.
+          const aishe = validateAisheCode(req.body.aisheCode);
+          if (!aishe.isValid) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: aishe.error });
           }
+          const officialDomain = String(req.body.officialDomain || '').trim();
+          if (!officialDomain) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Official website domain is required (e.g. coep.ac.in).' });
+          }
+          if (!emailDomainMatchesSite(normalizedEmail, officialDomain)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: `The email domain does not match your institution's official website (${officialDomain}). Use an email on your official domain, or correct the website address.` });
+          }
+          verificationStatus = 'verified';
         } else if (role === 'industry') {
-          const blockedDomains = ['@gmail.com', '@yahoo.com', '@outlook.com', '@hotmail.com'];
-          if (blockedDomains.some(d => normalizedEmail.endsWith(d))) {
-             await client.query('ROLLBACK');
-             return res.status(400).json({ error: 'Free email domains are blocked for Industry registration.' });
+          if (FREE_EMAIL_DOMAINS.includes(emailDomainOf(normalizedEmail))) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Free email domains (Gmail, Yahoo, Outlook, Hotmail) are blocked for Industry registration — use your company work email.' });
           }
-          const { cinGstin } = req.body;
-          const cinRegex = /^[LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}$/i;
-          const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/i;
-          if (cinGstin && (cinRegex.test(cinGstin) || gstinRegex.test(cinGstin))) {
+          const cinGstin = String(req.body.cinGstin || '').trim();
+          const incorporationDoc = req.body.incorporationDocument ? String(req.body.incorporationDocument).slice(0, 500) : null;
+          if (cinGstin) {
+            const cin = validateCinOrGstin(cinGstin);
+            if (!cin.isValid) {
+              await client.query('ROLLBACK');
+              return res.status(400).json({ error: cin.error });
+            }
             verificationStatus = 'verified';
-          } else {
+          } else if (incorporationDoc) {
+            // MSME / startup fallback: Udyam or Incorporation certificate
+            // uploaded — work email already verified via OTP, pending admin.
             verificationStatus = 'pending_admin_approval';
+          } else {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Provide a valid CIN or GSTIN, or upload an Udyam/Incorporation certificate.' });
           }
         } else if (role === 'alumni') {
+          // Alumni register with graduation year + enrollment/PRN + LinkedIn.
+          // The college TPO must approve the record before it becomes a
+          // verified mentor — no auto-approval.
+          const linkedinUrl = String(req.body.linkedinUrl || '').trim();
+          studentEnrollment = (req.body.enrollmentNumber && String(req.body.enrollmentNumber).trim()) || null;
+          if (!studentEnrollment) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Enrollment number / PRN is required for Alumni registration.' });
+          }
+          if (!linkedinUrl || !LINKEDIN_PROFILE_REGEX.test(linkedinUrl)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'A valid LinkedIn profile URL (https://linkedin.com/in/…) is required for Alumni registration.' });
+          }
           verificationStatus = 'pending_college_approval';
         }
 
@@ -2988,11 +3096,13 @@ router.post('/register', async (req: Request, res: Response) => {
         `INSERT INTO students (
           id, user_id, name, email, avatar, college, degree, branch, semester, cgpa,
           graduation_year, target_role, bio, resume_uploaded, resume_name,
-          declared_skills, verified_skills, assessment_completed, readiness_score
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NULL, '[]'::jsonb, '[]'::jsonb, FALSE, 15)
+          declared_skills, verified_skills, assessment_completed, readiness_score,
+          enrollment_number, prn
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, FALSE, NULL, '[]'::jsonb, '[]'::jsonb, FALSE, 15, $14, $15)
         ON CONFLICT (email) DO UPDATE SET
           name = $3, college = $6, degree = $7, branch = $8, semester = $9,
-          cgpa = $10, graduation_year = $11, target_role = $12, bio = $13
+          cgpa = $10, graduation_year = $11, target_role = $12, bio = $13,
+          enrollment_number = $14, prn = $15
         RETURNING *`,
         [
           studentId,
@@ -3008,64 +3118,54 @@ router.post('/register', async (req: Request, res: Response) => {
           gradYear,
           targetRole || 'Full Stack Cloud Engineer',
           bio || `Undergraduate student at ${college || 'engineering institute'}.`,
+          studentEnrollment,
+          studentPrn,
         ]
       );
 
       studentRecord = studentRes.rows[0];
       }
       if (role === 'alumni') {
-        const alumniId = `alum-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-        // Schema requires a valid alumni_applications FK — auto-create an
-        // approved application record (the email is already OTP-verified).
+        const linkedinUrl = String(req.body.linkedinUrl || '').trim();
+        const alumniGradYear = parseInt(graduationYear, 10) || (new Date().getFullYear() - 4);
+        // Schema requires a valid alumni_applications FK — create the PENDING
+        // application the college TPO must approve (email is OTP-verified;
+        // the mentor record is minted only on desk approval).
         const appId = `alumapp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
         await client.query(
           `INSERT INTO alumni_applications (
              id, full_name, email, college_id, college_name, degree, graduation_year,
-             company, designation, expertise, status, review_note, reviewed_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'approved', 'Auto-approved via verified registration.', CURRENT_TIMESTAMP)
+             company, designation, linkedin_url, status, review_note
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', 'Awaiting college TPO approval (registered via portal).')
            ON CONFLICT (id) DO NOTHING`,
           [appId, name.trim(), normalizedEmail, 'inst-default',
-           college || 'Institute of Engineering & Technology', 'B.Tech', new Date().getFullYear() - 4,
-           company || 'Enterprise Corp', designation || 'Alumni / Mentor',
-           JSON.stringify([targetRole || 'Industry Insights'])]
-        );
-        await client.query(
-          `INSERT INTO alumni (id, application_id, name, email, phone, college_id, college_name, degree, graduation_year, company, designation, expertise, mentor_capacity)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-           ON CONFLICT (email) DO NOTHING`,
-          [
-            alumniId,
-            appId,
-            name.trim(),
-            normalizedEmail,
-            'Not provided',
-            'inst-default',
-            college || 'Institute of Engineering & Technology',
-            'B.Tech',
-            new Date().getFullYear() - 4,
-            company || 'Enterprise Corp',
-            designation || 'Alumni / Mentor',
-            JSON.stringify([targetRole || 'Industry Insights']),
-            10
-          ]
+           college || 'Institute of Engineering & Technology', 'B.Tech', alumniGradYear,
+           company || 'Enterprise Corp', designation || 'Alumni / Mentor', linkedinUrl]
         );
       }
 
       if (role === 'college') {
         const instId = `inst-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const affiliationDoc = req.body.affiliationDocument ? String(req.body.affiliationDocument).slice(0, 500) : null;
         await client.query(
-          `INSERT INTO institutions (id, user_id, aishe_code, official_domain)
-           VALUES ($1, $2, $3, $4)`,
-          [instId, effectiveUserId, req.body.aisheCode || null, req.body.officialDomain || null]
+          `INSERT INTO institutions (id, user_id, aishe_code, official_domain, affiliation_document_url)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [instId, effectiveUserId,
+           String(req.body.aisheCode || '').trim().toUpperCase(),
+           String(req.body.officialDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, ''),
+           affiliationDoc]
         );
       }
 
       if (role === 'industry') {
         const indId = `ind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const incorporationDoc = req.body.incorporationDocument ? String(req.body.incorporationDocument).slice(0, 500) : null;
         await client.query(
-          `INSERT INTO industries (id, user_id, cin_gstin)
-           VALUES ($1, $2, $3)`,
-          [indId, effectiveUserId, req.body.cinGstin || null]
+          `INSERT INTO industries (id, user_id, cin_gstin, incorporation_document_url)
+           VALUES ($1, $2, $3, $4)`,
+          [indId, effectiveUserId,
+           String(req.body.cinGstin || '').trim().toUpperCase() || null,
+           incorporationDoc]
         );
       }
 
@@ -3128,6 +3228,292 @@ router.post('/register', async (req: Request, res: Response) => {
     }
     console.error('Registration error:', error.message);
     res.status(500).json({ error: 'Registration failed. Please try again.' });
+  }
+});
+
+// ==========================================
+// 11b. PORTAL ROLE VERIFICATION MATRIX — endpoints
+// ==========================================
+
+// My verification status (any signed-in role): shows the badge on the
+// dashboard and tells industry/college accounts what document to upload.
+router.get('/verify/institution-status', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const u = await query(`SELECT id, name, email, role, verification_status FROM users WHERE id = $1`, [user.sub]);
+    if (u.rows.length === 0) return res.status(404).json({ error: 'Account not found.' });
+    const row = u.rows[0];
+    let institution: any = null;
+    let industry: any = null;
+    if (row.role === 'college') {
+      const inst = await query(`SELECT aishe_code, official_domain, affiliation_document_url, created_at FROM institutions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [user.sub]);
+      institution = inst.rows[0] || null;
+    }
+    if (row.role === 'industry') {
+      const ind = await query(`SELECT cin_gstin, incorporation_document_url, created_at FROM industries WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`, [user.sub]);
+      industry = ind.rows[0] || null;
+    }
+    res.json({
+      success: true,
+      verificationStatus: row.verification_status || 'pending',
+      statusLabel: {
+        verified: 'Verified',
+        pending_college_approval: 'Pending college approval',
+        pending_admin_approval: 'Pending platform admin approval',
+        rejected: 'Verification rejected',
+        pending: 'Verification pending',
+      }[row.verification_status || 'pending'] || 'Verification pending',
+      institution,
+      industry,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Udyam / Incorporation / AICTE affiliation letter upload (industry + college).
+// Persisted to disk and linked on the account for the admin approval queue.
+router.post('/verify/affiliation-document', requireAuth, upload.single('document'), async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    if (!req.file) return res.status(400).json({ error: 'Attach the certificate file (PDF/JPG/PNG).' });
+    const u = await query(`SELECT role FROM users WHERE id = $1`, [user.sub]);
+    if (u.rows.length === 0) return res.status(404).json({ error: 'Account not found.' });
+    const role = u.rows[0].role;
+    if (role !== 'industry' && role !== 'college') {
+      return res.status(403).json({ error: 'Only Institution and Industry accounts can submit verification documents.' });
+    }
+    const safeName = req.file.originalname.replace(/[^A-Za-z0-9._-]/g, '_').slice(-80);
+    const docUrl = `/uploads/verify/${Date.now()}-${safeName}`;
+    const absPath = path.join(process.cwd(), docUrl);
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.writeFileSync(absPath, req.file.buffer);
+
+    if (role === 'college') {
+      await query(`UPDATE institutions SET affiliation_document_url = $2 WHERE user_id = $1`, [user.sub, docUrl]);
+    } else {
+      await query(`UPDATE industries SET incorporation_document_url = $2 WHERE user_id = $1`, [user.sub, docUrl]);
+    }
+    // Document submitted → (re)enter the admin approval queue.
+    await query(`UPDATE users SET verification_status = 'pending_admin_approval' WHERE id = $1 AND verification_status <> 'verified'`, [user.sub]);
+    await query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
+      [user.sub, role === 'college' ? 'AFFILIATION_DOC_UPLOADED' : 'INCORPORATION_DOC_UPLOADED', JSON.stringify({ file: safeName, size: req.file.size })]
+    ).catch(() => {});
+    res.json({ success: true, documentUrl: docUrl, status: 'pending_admin_approval' });
+  } catch (error: any) {
+    console.error('affiliation document upload failed:', error.message);
+    res.status(500).json({ error: 'Failed to store the document.' });
+  }
+});
+
+// Platform Admin desk: accounts awaiting document-based verification.
+router.get('/verify/admin-queue', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const r = await query(
+      `SELECT u.id, u.name, u.email, u.role, u.verification_status, u.created_at,
+              i.aishe_code, i.official_domain, i.affiliation_document_url,
+              ind.cin_gstin, ind.incorporation_document_url
+         FROM users u
+         LEFT JOIN institutions i ON i.user_id = u.id
+         LEFT JOIN industries ind ON ind.user_id = u.id
+        WHERE u.verification_status IN ('pending_admin_approval', 'rejected')
+        ORDER BY u.created_at ASC
+        LIMIT 200`
+    );
+    res.json({ success: true, accounts: r.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Platform Admin: verify / reject an institution or industry account.
+router.patch('/verify/admin-queue/:userId', requireAdmin, async (req: Request, res: Response) => {
+  const { decision, reviewNote } = req.body || {};
+  if (!['verified', 'rejected'].includes(decision)) {
+    return res.status(400).json({ error: "decision must be 'verified' or 'rejected'." });
+  }
+  try {
+    const admin = (req as any).user;
+    const target = await query(`SELECT id, name, email, role, verification_status FROM users WHERE id = $1`, [req.params.userId]);
+    if (target.rows.length === 0) return res.status(404).json({ error: 'Account not found.' });
+    const acct = target.rows[0];
+    if (acct.role !== 'college' && acct.role !== 'industry') {
+      return res.status(400).json({ error: 'Only Institution or Industry accounts go through admin verification.' });
+    }
+    if (acct.verification_status === 'verified' && decision === 'verified') {
+      return res.status(409).json({ error: 'Account is already verified.' });
+    }
+    await query(`UPDATE users SET verification_status = $2 WHERE id = $1`, [acct.id, decision]);
+    await query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'ADMIN_VERIFICATION_DECISION', $2)`,
+      [admin.email || admin.sub, JSON.stringify({ targetUserId: acct.id, targetEmail: acct.email, role: acct.role, decision, note: reviewNote || null })]
+    ).catch(() => {});
+    insertNotification(acct.id,
+      decision === 'verified' ? 'Account Verified ✓' : 'Verification Rejected',
+      decision === 'verified'
+        ? `Your ${acct.role === 'college' ? 'institution' : 'company'} account is now verified. Welcome aboard!`
+        : `Your verification was not approved.${reviewNote ? ` Note: ${reviewNote}` : ''} You can re-upload documents and resubmit.`,
+      decision === 'verified' ? 'success' : 'alert'
+    );
+    res.json({ success: true, status: decision });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// College TPO desk: students pending college approval + alumni applications
+// from portal registrations, scoped to this college's own institution.
+router.get('/verify/college-approvals', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const me = await query(`SELECT id, name FROM users WHERE id = $1 AND role = 'college'`, [user.sub]);
+    if (me.rows.length === 0) return res.status(403).json({ error: 'College (TPO) access required.' });
+
+    const students = await query(
+      `SELECT u.id, u.name, u.email, u.verification_status, u.created_at,
+              s.id AS student_id, s.college, s.branch, s.graduation_year, s.enrollment_number, s.prn
+         FROM users u JOIN students s ON s.user_id = u.id
+        WHERE u.verification_status = 'pending_college_approval'
+        ORDER BY u.created_at ASC
+        LIMIT 200`
+    );
+    // Alumni portal registrations land in alumni_applications as pending rows.
+    const alumniApps = await query(
+      `SELECT id, full_name, email, college_name, degree, graduation_year, company, designation, linkedin_url, created_at
+         FROM alumni_applications
+        WHERE status = 'pending' AND review_note LIKE '%portal%'
+        ORDER BY created_at ASC
+        LIMIT 200`
+    );
+    res.json({ success: true, students: students.rows, alumniApplications: alumniApps.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// College TPO: one-click approve / reject.
+//   kind=student → flips users.verification_status to verified.
+//   kind=alumni  → approves the application and mints the verified mentor
+//                  record (unlocks the Enable Mentor Profile toggle).
+router.patch('/verify/college-approvals/:userId', requireAuth, async (req: Request, res: Response) => {
+  const { decision, kind, reviewNote } = req.body || {};
+  if (!['verified', 'rejected'].includes(decision) || !['student', 'alumni'].includes(kind)) {
+    return res.status(400).json({ error: "decision must be 'verified'/'rejected' and kind 'student'/'alumni'." });
+  }
+  try {
+    const user = (req as any).user;
+    const me = await query(`SELECT id, email FROM users WHERE id = $1 AND role = 'college'`, [user.sub]);
+    if (me.rows.length === 0) return res.status(403).json({ error: 'College (TPO) access required.' });
+
+    if (kind === 'student') {
+      const target = await query(
+        `SELECT u.id, u.name, u.email, u.verification_status FROM users u JOIN students s ON s.user_id = u.id WHERE u.id = $1`,
+        [req.params.userId]
+      );
+      if (target.rows.length === 0) return res.status(404).json({ error: 'Student not found.' });
+      const stu = target.rows[0];
+      if (stu.verification_status !== 'pending_college_approval') {
+        return res.status(409).json({ error: `Student is not awaiting approval (status: ${stu.verification_status}).` });
+      }
+      await query(`UPDATE users SET verification_status = $2 WHERE id = $1`, [stu.id, decision]);
+      await query(
+        `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'COLLEGE_STUDENT_APPROVAL', $2)`,
+        [me.rows[0].email || me.rows[0].id, JSON.stringify({ studentUserId: stu.id, decision, note: reviewNote || null })]
+      ).catch(() => {});
+      insertNotification(stu.id,
+        decision === 'verified' ? 'Student Account Approved ✓' : 'Student Verification Declined',
+        decision === 'verified'
+          ? 'Your college TPO approved your account — full portal access unlocked.'
+          : `Your college declined your verification.${reviewNote ? ` Note: ${reviewNote}` : ''}`,
+        decision === 'verified' ? 'success' : 'alert'
+      );
+      return res.json({ success: true, status: decision });
+    }
+
+    // kind === 'alumni': userId param carries the alumni_applications id
+    const appRes = await query(`SELECT * FROM alumni_applications WHERE id = $1`, [req.params.userId]);
+    if (appRes.rows.length === 0) return res.status(404).json({ error: 'Alumni application not found.' });
+    const app = appRes.rows[0];
+    if (app.status !== 'pending') return res.status(409).json({ error: 'Application has already been reviewed.' });
+
+    if (decision === 'rejected') {
+      await query(`UPDATE alumni_applications SET status = 'rejected', review_note = $2, reviewed_at = CURRENT_TIMESTAMP WHERE id = $1`, [app.id, reviewNote || 'Declined by college TPO.']);
+      const targetUser = await query(`SELECT id FROM users WHERE LOWER(email) = LOWER($1)`, [app.email]);
+      if (targetUser.rows[0]) await query(`UPDATE users SET verification_status = 'rejected' WHERE id = $1`, [targetUser.rows[0].id]);
+      await query(
+        `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'COLLEGE_ALUMNI_REJECTED', $2)`,
+        [me.rows[0].email || me.rows[0].id, JSON.stringify({ applicationId: app.id })]
+      ).catch(() => {});
+      return res.json({ success: true, status: 'rejected' });
+    }
+
+    // Approve → mint the verified alumni mentor record
+    const alumniId = `alum-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    await query(
+      `INSERT INTO alumni (
+        id, application_id, name, email, college_id, college_name, degree, graduation_year,
+        company, designation, expertise, linkedin_url, avatar_url, verified_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, CURRENT_TIMESTAMP)
+      ON CONFLICT (email) DO UPDATE SET verified_at = CURRENT_TIMESTAMP, linkedin_url = EXCLUDED.linkedin_url`,
+      [
+        alumniId, app.id, app.full_name, app.email, app.college_id, app.college_name,
+        app.degree, app.graduation_year, app.company, app.designation,
+        JSON.stringify([]), app.linkedin_url,
+        `https://api.dicebear.com/7.x/notionists/svg?seed=${encodeURIComponent(app.full_name)}`,
+      ]
+    );
+    await query(`UPDATE alumni_applications SET status = 'approved', review_note = 'Approved by college TPO (portal registration).', reviewed_at = CURRENT_TIMESTAMP WHERE id = $1`, [app.id]);
+    const targetUser = await query(`SELECT id FROM users WHERE LOWER(email) = LOWER($1)`, [app.email]);
+    if (targetUser.rows[0]) await query(`UPDATE users SET verification_status = 'verified' WHERE id = $1`, [targetUser.rows[0].id]);
+    await query(
+      `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'COLLEGE_ALUMNI_APPROVED', $2)`,
+      [me.rows[0].email || me.rows[0].id, JSON.stringify({ applicationId: app.id, alumniId })]
+    ).catch(() => {});
+    insertNotification(targetUser.rows[0]?.id || null,
+      'Alumni Record Verified 🎓',
+      'Your college TPO approved your alumni record — the Mentor Profile toggle is now unlocked in your dashboard.',
+      'success'
+    );
+    res.json({ success: true, status: 'approved', alumniId });
+  } catch (error: any) {
+    console.error('college approval failed:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Alumni: enable / update the Mentor Profile (only after college approval).
+router.patch('/alumni/mentor-profile', requireAuth, async (req: Request, res: Response) => {
+  const { isMentor, mentorCapacity, techStack, currentCompany, currentRole } = req.body || {};
+  try {
+    const user = (req as any).user;
+    const r = await query(`SELECT id, verified_at FROM alumni WHERE LOWER(email) = (SELECT LOWER(email) FROM users WHERE id = $1)`, [user.sub]);
+    if (r.rows.length === 0) {
+      return res.status(403).json({ error: 'Your alumni record is not yet approved by your college — the mentor profile stays locked.' });
+    }
+    if (!r.rows[0].verified_at) {
+      return res.status(403).json({ error: 'Mentor profile unlocks after your college verifies your alumni record.' });
+    }
+    const tech = Array.isArray(techStack) ? techStack.slice(0, 20).map((t: any) => String(t).slice(0, 40)) : undefined;
+    await query(
+      `UPDATE alumni SET
+         is_mentor = COALESCE($2, is_mentor),
+         mentor_capacity = COALESCE($3, mentor_capacity),
+         mentor_tech_stack = COALESCE($4::jsonb, mentor_tech_stack),
+         company = COALESCE($5, company),
+         designation = COALESCE($6, designation)
+       WHERE id = $1`,
+      [r.rows[0].id,
+        typeof isMentor === 'boolean' ? isMentor : null,
+        Number.isFinite(Number(mentorCapacity)) ? Math.max(1, Math.min(50, Number(mentorCapacity))) : null,
+        tech ? JSON.stringify(tech) : null,
+        currentCompany ? String(currentCompany).slice(0, 200) : null,
+        currentRole ? String(currentRole).slice(0, 200) : null]
+    );
+    const updated = await query(`SELECT is_mentor, mentor_capacity, mentor_tech_stack, company, designation FROM alumni WHERE id = $1`, [r.rows[0].id]);
+    res.json({ success: true, profile: updated.rows[0] });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -3336,7 +3722,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
   try {
     const userRes = await query(
-      `SELECT id, name, email, role, avatar, password_hash, COALESCE(token_version, 0) AS token_version FROM users WHERE LOWER(email) = $1`,
+      `SELECT id, name, email, role, avatar, password_hash, verification_status, COALESCE(token_version, 0) AS token_version FROM users WHERE LOWER(email) = $1`,
       [normalizedEmail]
     );
     const user = userRes.rows[0];
@@ -3381,6 +3767,7 @@ router.post('/login', async (req: Request, res: Response) => {
         email: user.email,
         role: user.role,
         avatar: user.avatar,
+        verificationStatus: user.verification_status || 'verified',
       },
       message: `Welcome back, ${user.name}!`,
     });
@@ -4223,6 +4610,8 @@ const alumniRowMapper = (r: any) => ({
   linkedinUrl: r.linkedin_url || undefined,
   avatarUrl: r.avatar_url || undefined,
   mentorCapacity: r.mentor_capacity ?? 5,
+  isMentor: !!r.is_mentor,
+  mentorTechStack: r.mentor_tech_stack || [],
   activeMentees: r.active_mentees ?? 0,
   rating: r.rating ? Number(r.rating) : undefined,
   verifiedAt: r.verified_at,

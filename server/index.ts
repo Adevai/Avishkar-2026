@@ -96,6 +96,12 @@ const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const RATE_LIMIT_MAX = 20; // 20 requests per window per IP per endpoint group
 
+// Test-only reset so an isolated suite run (many OTP/login calls from one IP)
+// can clear the bucket between describes without weakening production limits.
+export function __resetAuthRateBucketsForTests() {
+  rateBuckets.clear();
+}
+
 function rateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
   const key = `${req.ip}-${req.baseUrl || req.path}`;
   const now = Date.now();
@@ -147,6 +153,11 @@ app.get('/', (req, res) => {
     ]
   });
 });
+
+// ── Verification documents (affiliation/incorporation certificates) ─────────
+// Public read for reviewers; files are unguessable timestamped names. Serve
+// before the SPA fallback so document links resolve.
+app.use('/uploads/verify', express.static(path.join(process.cwd(), 'uploads', 'verify'), { maxAge: '1h' }));
 
 // ── Production static serving: the Express host serves the built frontend ────
 // ESM-safe dirname: __dirname is undefined under tsx/ESM, so derive the server

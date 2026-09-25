@@ -437,6 +437,67 @@ export const api = {
     return { success: !!res && res.ok };
   },
 
+  // ── Portal role verification matrix ─────────────────────────────────────
+  async getVerificationStatus(): Promise<{ success: boolean; verificationStatus: string; statusLabel: string; institution?: any; industry?: any }> {
+    const res = await authFetch(`${API_BASE}/verify/institution-status`);
+    if (!res.ok) throw new Error('Failed to load verification status');
+    return await res.json();
+  },
+
+  async uploadVerificationDocument(file: File): Promise<{ success: boolean; documentUrl: string; status: string }> {
+    const fd = new FormData();
+    fd.append('document', file);
+    const res = await authFetch(`${API_BASE}/verify/affiliation-document`, { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
+    return data;
+  },
+
+  async getAdminVerificationQueue(): Promise<{ success: boolean; accounts: any[] }> {
+    const res = await authFetch(`${API_BASE}/verify/admin-queue`);
+    if (!res.ok) throw new Error('Failed to load the verification queue');
+    return await res.json();
+  },
+
+  async decideAdminVerification(userId: string, decision: 'verified' | 'rejected', reviewNote?: string): Promise<{ success: boolean; status: string }> {
+    const res = await authFetch(`${API_BASE}/verify/admin-queue/${encodeURIComponent(userId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, reviewNote }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Decision failed');
+    return data;
+  },
+
+  async getCollegeApprovals(): Promise<{ success: boolean; students: any[]; alumniApplications: any[] }> {
+    const res = await authFetch(`${API_BASE}/verify/college-approvals`);
+    if (!res.ok) throw new Error('Failed to load pending approvals');
+    return await res.json();
+  },
+
+  async decideCollegeApproval(userIdOrAppId: string, kind: 'student' | 'alumni', decision: 'verified' | 'rejected', reviewNote?: string): Promise<{ success: boolean; status: string }> {
+    const res = await authFetch(`${API_BASE}/verify/college-approvals/${encodeURIComponent(userIdOrAppId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, kind, reviewNote }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Decision failed');
+    return data;
+  },
+
+  async updateMentorProfile(payload: { isMentor?: boolean; mentorCapacity?: number; techStack?: string[]; currentCompany?: string; currentRole?: string }): Promise<{ success: boolean; profile: any }> {
+    const res = await authFetch(`${API_BASE}/alumni/mentor-profile`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to update the mentor profile');
+    return data;
+  },
+
   async getRecruiterInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[]; counts: { scheduled: number; completed: number; cancelled: number } }> {
     const res = await authFetch(`${API_BASE}/recruiter/interview-slots`);
     if (!res.ok) throw new Error('Failed to fetch the interview schedule');

@@ -96,6 +96,15 @@ export const Register: React.FC = () => {
   const [govtDept, setGovtDept] = useState('State Directorate of Technical Education (DTE)');
   const [govtJurisdiction, setGovtJurisdiction] = useState('Western Regional Directorate');
 
+  // Portal role verification matrix fields
+  const [aisheCode, setAisheCode] = useState('');
+  const [officialDomain, setOfficialDomain] = useState('');
+  const [affiliationFile, setAffiliationFile] = useState<File | null>(null);
+  const [cinGstin, setCinGstin] = useState('');
+  const [incorporationFile, setIncorporationFile] = useState<File | null>(null);
+  const [enrollmentNumber, setEnrollmentNumber] = useState('');
+  const [linkedinUrl, setLinkedinUrl] = useState('');
+
   const accountTypes = [
     { 
       id: 'student', 
@@ -233,7 +242,26 @@ export const Register: React.FC = () => {
         department: accountType === 'college' ? facultyDept : govtDept,
         designation: accountType === 'college' ? designation : (accountType === 'industry' ? recruiterTitle : designation),
         jurisdiction: govtJurisdiction,
+        // Verification matrix fields
+        enrollmentNumber: enrollmentNumber.trim() || undefined,
+        prn: enrollmentNumber.trim() || undefined,
+        linkedinUrl: linkedinUrl.trim() || undefined,
+        aisheCode: aisheCode.trim() || undefined,
+        officialDomain: officialDomain.trim() || undefined,
+        cinGstin: cinGstin.trim() || undefined,
       });
+
+      // Certificates upload after the account exists (needs the session token).
+      const docFile = accountType === 'college' ? affiliationFile : (accountType === 'industry' ? incorporationFile : null);
+      if (docFile) {
+        try {
+          // A session was NOT created by register (the user signs in next), so
+          // upload only if we hold a token; otherwise the user can upload from
+          // the dashboard banner after signing in.
+          const { getToken } = await import('../services/api');
+          if (getToken()) await api.uploadVerificationDocument(docFile);
+        } catch { /* non-fatal: can be re-uploaded from the dashboard */ }
+      }
 
       localStorage.setItem('spark_new_registration', 'true');
       localStorage.removeItem('spark_intake_completed');
@@ -699,6 +727,17 @@ export const Register: React.FC = () => {
                 </div>
 
                 <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">PRN / Roll No.</label>
+                  <input
+                    type="text"
+                    value={enrollmentNumber}
+                    onChange={(e) => setEnrollmentNumber(e.target.value)}
+                    placeholder="Optional — speeds up college verification"
+                    className="mt-1 block w-full px-3 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none bg-white font-mono font-medium"
+                  />
+                </div>
+
+                <div>
                   <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Grad Year</label>
                   <select
                     value={graduationYear}
@@ -749,6 +788,42 @@ export const Register: React.FC = () => {
                 label="Institution / University"
                 placeholder="Search college, university, or institute..."
               />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">AISHE Code *</label>
+                  <input
+                    type="text"
+                    required
+                    value={aisheCode}
+                    onChange={(e) => setAisheCode(e.target.value.toUpperCase())}
+                    placeholder="C-33915"
+                    className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white font-mono"
+                  />
+                  <p className="mt-1 text-[10px] text-slate-400">Format: C-##### (College) or U-##### (University)</p>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Official Website Domain *</label>
+                  <input
+                    type="text"
+                    required
+                    value={officialDomain}
+                    onChange={(e) => setOfficialDomain(e.target.value.toLowerCase())}
+                    placeholder="coep.ac.in"
+                    className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white font-mono"
+                  />
+                  <p className="mt-1 text-[10px] text-slate-400">Your sign-up email must be on this domain</p>
+                </div>
+              </div>
+              <div className="p-3 bg-slate-50/80 border border-slate-200 rounded-2xl">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">AICTE / University Affiliation Letter (optional)</label>
+                <input
+                  type="file"
+                  accept=".pdf,.jpg,.jpeg,.png"
+                  onChange={(e) => setAffiliationFile(e.target.files?.[0] || null)}
+                  className="mt-2 block w-full text-xs text-slate-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white file:text-xs file:font-bold"
+                />
+                <p className="mt-1.5 text-[10px] text-slate-400">Upload for priority review by the Platform Admin desk.</p>
+              </div>
               <div>
                 <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Department</label>
                 <input
@@ -810,6 +885,28 @@ export const Register: React.FC = () => {
                   className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white"
                 />
               </div>
+              <div>
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">CIN or GSTIN *</label>
+                <input
+                  type="text"
+                  required
+                  value={cinGstin}
+                  onChange={(e) => setCinGstin(e.target.value.toUpperCase())}
+                  placeholder="L12345MH2020PLC123456 / 27AAPFU0939F1ZV"
+                  className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white font-mono"
+                />
+                <p className="mt-1 text-[10px] text-slate-400">Verified instantly — startups without one may upload a certificate below instead.</p>
+              </div>
+              <div className="p-3 bg-slate-50/80 border border-slate-200 rounded-2xl">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Udyam / Incorporation Certificate (startup fallback)</label>
+                <input
+                  type="file"
+                  accept=".pdf,.jpg,.jpeg,.png"
+                  onChange={(e) => setIncorporationFile(e.target.files?.[0] || null)}
+                  className="mt-2 block w-full text-xs text-slate-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-blue-600 file:text-white file:text-xs file:font-bold"
+                />
+                <p className="mt-1.5 text-[10px] text-slate-400">Required only if you could not provide a CIN/GSTIN. Reviewed by the Platform Admin desk.</p>
+              </div>
             </div>
           )}
 
@@ -835,6 +932,70 @@ export const Register: React.FC = () => {
                   onChange={(e) => setGovtJurisdiction(e.target.value)}
                   className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white"
                 />
+              </div>
+            </div>
+          )}
+
+          {/* ALUMNI / MENTOR FORM */}
+          {accountType === 'alumni' && (
+            <div className="space-y-3.5">
+              <CollegeAutocomplete
+                value={college}
+                onChange={(name) => setCollege(name)}
+                label="College / University you graduated from"
+                placeholder="Search your institution..."
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Graduation Year *</label>
+                  <select
+                    value={graduationYear}
+                    onChange={(e) => setGraduationYear(e.target.value)}
+                    className="mt-1 block w-full px-3 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none bg-white font-medium"
+                  >
+                    {Array.from({ length: 35 }, (_, i) => 2026 - i).map((yr) => (
+                      <option key={yr} value={yr.toString()}>{yr}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Enrollment No. / PRN *</label>
+                  <input
+                    type="text"
+                    required
+                    value={enrollmentNumber}
+                    onChange={(e) => setEnrollmentNumber(e.target.value)}
+                    placeholder="e.g. B210266 / 2101234E"
+                    className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white font-mono"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">LinkedIn Profile URL *</label>
+                <input
+                  type="url"
+                  required
+                  value={linkedinUrl}
+                  onChange={(e) => setLinkedinUrl(e.target.value)}
+                  placeholder="https://linkedin.com/in/your-profile"
+                  className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Current Company</label>
+                <input
+                  type="text"
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                  placeholder="Where you work today"
+                  className="mt-1 block w-full px-3.5 py-2.5 text-xs sm:text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 outline-none transition-all bg-white"
+                />
+              </div>
+              <div className="p-3 bg-amber-50/80 border border-amber-200 rounded-2xl flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <p className="text-[11px] text-amber-800 font-medium">
+                  Your college's TPO verifies your alumni record against institutional records. Once approved, the <strong>Enable Mentor Profile</strong> toggle unlocks in your dashboard.
+                </p>
               </div>
             </div>
           )}

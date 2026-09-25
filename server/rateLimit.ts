@@ -37,6 +37,12 @@ export interface RateLimitResult {
   remaining: number;
 }
 
+// Test-only reset so an isolated suite run can clear per-IP+identity buckets
+// without weakening production limits.
+export function __resetRateLimitsForTests() {
+  hits.clear();
+}
+
 export function checkRateLimit(key: string, maxHits = MAX_HITS): RateLimitResult {
   const now = Date.now();
   let rec = hits.get(key);

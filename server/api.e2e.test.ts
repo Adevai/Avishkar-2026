@@ -443,6 +443,254 @@ describe('POST /api/register (duplicate account guard)', () => {
   });
 });
 
+// ── PORTAL ROLE VERIFICATION MATRIX ────────────────────────────────────────
+describe('Portal role verification matrix', () => {
+  const stamp = Date.now();
+  const gmailStudentEmail = `e2e-gmail-stu-${stamp}@gmail.com`;
+  const acStudentEmail = `e2e-ac-stu-${stamp}@iitb.ac.in`;
+  const collegeEmail = `e2e-college-${stamp}@spark-inst.test`;
+  const industryEmail = `e2e-ind-${stamp}@tcs.test`;
+  const freeIndEmail = `e2e-freeind-${stamp}@gmail.com`;
+  const alumniEmail = `e2e-alum-${stamp}@spark.test`;
+  let adminToken = '';
+  let collegeToken = '';
+  let alumniUserId = '';
+  let alumniAppId = '';
+
+  const registerViaOtp = async (payload: Record<string, any>): Promise<number> => {
+    // Many registrations run back-to-back from one IP; keep the auth bucket
+    // clear so we exercise the real flows, not the 429s.
+    const { __resetAuthRateBucketsForTests } = await import('./index');
+    __resetAuthRateBucketsForTests();
+    const email = String(payload.email);
+    await request(app).post('/api/auth/register-send-otp').send({ email, name: payload.name || 'E2E Verify' });
+    const otpRow = await pool.query(
+      'SELECT otp FROM otp_verifications WHERE LOWER(email) = $1 ORDER BY created_at DESC LIMIT 1',
+      [email]
+    );
+    if (!otpRow.rows[0]?.otp) return 500; // SMTP-less env; OTP dispatch failed
+    await request(app).post('/api/auth/register-verify-otp').send({ email, otp: otpRow.rows[0].otp });
+    const reg = await request(app).post('/api/register').send(payload);
+    return reg.status;
+  };
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    // This suite makes many OTP + login calls from the test IP; clear the
+    // auth buckets so earlier describes don't starve later ones (and we don't
+    // starve them).
+    const { __resetAuthRateBucketsForTests } = await import('./index');
+    const { __resetRateLimitsForTests } = await import('./rateLimit');
+    __resetAuthRateBucketsForTests();
+    __resetRateLimitsForTests();
+    const { hashPassword } = await import('./auth');
+    // Platform admin (government role) for the admin verification desk
+    const adminHash = await hashPassword('Admin!2026');
+    await pool.query(
+      `INSERT INTO users (id, name, email, role, password_hash)
+       VALUES ($1, 'E2E Gov Admin', $2, 'government', $3)
+       ON CONFLICT (email) DO UPDATE SET password_hash = $3`,
+      [`usr-e2e-verify-admin-${stamp}`, `e2e-verify-admin-${stamp}@gov.test`, adminHash]
+    );
+    const adminLogin = await request(app).post('/api/login').send({ email: `e2e-verify-admin-${stamp}@gov.test`, password: 'Admin!2026' });
+    adminToken = adminLogin.body.token;
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    const emails = [gmailStudentEmail, acStudentEmail, collegeEmail, industryEmail, freeIndEmail, alumniEmail, `e2e-verify-admin-${stamp}@gov.test`];
+    for (const e of emails) {
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM students WHERE LOWER(email) = $1`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM alumni WHERE LOWER(email) = $1`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM alumni_applications WHERE LOWER(email) = $1`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM institutions WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM industries WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE LOWER(email) = $1`, [e]).catch(() => {});
+    }
+  });
+
+  dbIt('student with institutional domain + OTP auto-verifies', async () => {
+    const status = await registerViaOtp({
+      role: 'student', name: 'E2E AC Student', email: acStudentEmail, password: 'AcStu@2026',
+      college: 'Indian Institute of Technology Bombay', degree: 'B.Tech', branch: 'CSE', semester: 4, cgpa: 8.2,
+    });
+    expect(status).toBe(200);
+    const vs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [acStudentEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('verified');
+  });
+
+  dbIt('student with personal gmail lands in PENDING_COLLEGE_APPROVAL and the TPO approves in one click', async () => {
+    const status = await registerViaOtp({
+      role: 'student', name: 'E2E Gmail Student', email: gmailStudentEmail, password: 'GmStu@2026',
+      college: 'Some Local Engineering College', degree: 'B.Tech', branch: 'IT', semester: 3, cgpa: 7.4,
+    });
+    expect(status).toBe(200);
+    const vs = await pool.query(`SELECT verification_status, id FROM users WHERE LOWER(email) = $1`, [gmailStudentEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('pending_college_approval');
+  });
+
+  dbIt('college registration requires a valid AISHE code and a matching email domain', async () => {
+    const badAishe = await registerViaOtp({
+      role: 'college', name: 'E2E College Bad', email: `e2e-college-bad-${stamp}@spark-inst.test`, password: 'Col@2026',
+      aisheCode: 'COLLEGE-123', officialDomain: 'spark-inst.test',
+    });
+    expect(badAishe).toBe(400);
+
+    const domainMismatch = await registerViaOtp({
+      role: 'college', name: 'E2E College Wrong', email: collegeEmail, password: 'Col@2026',
+      aisheCode: 'C-33915', officialDomain: 'different-domain.edu',
+    });
+    expect(domainMismatch).toBe(400);
+
+    const good = await registerViaOtp({
+      role: 'college', name: 'E2E College Good', email: collegeEmail, password: 'Col@2026',
+      aisheCode: 'C-33915', officialDomain: 'spark-inst.test',
+    });
+    expect(good).toBe(200);
+    const vs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [collegeEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('verified');
+
+    const colLogin = await request(app).post('/api/login').send({ email: collegeEmail, password: 'Col@2026' });
+    collegeToken = colLogin.body.token;
+    expect(collegeToken).toBeTruthy();
+  });
+
+  dbIt('college TPO sees the gmail student in its queue and approves with one click', async () => {
+    const queue = await request(app).get('/api/verify/college-approvals').set('Authorization', `Bearer ${collegeToken}`);
+    expect(queue.status).toBe(200);
+    const pendingStudent = queue.body.students.find((s: any) => s.email === gmailStudentEmail);
+    expect(pendingStudent).toBeTruthy();
+
+    const approve = await request(app)
+      .patch(`/api/verify/college-approvals/${pendingStudent.id}`)
+      .set('Authorization', `Bearer ${collegeToken}`)
+      .send({ decision: 'verified', kind: 'student' });
+    expect(approve.status).toBe(200);
+    const vs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [gmailStudentEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('verified');
+  });
+
+  dbIt('industry blocks free mail domains and requires a valid CIN/GSTIN or certificate', async () => {
+    const freeMail = await registerViaOtp({
+      role: 'industry', name: 'E2E Free Ind', email: freeIndEmail, password: 'Ind@2026', company: 'Free Mail Corp',
+    });
+    expect(freeMail).toBe(400);
+
+    const badCin = await registerViaOtp({
+      role: 'industry', name: 'E2E Ind Bad Cin', email: `e2e-indbad-${stamp}@tcs.test`, password: 'Ind@2026',
+      company: 'Bad CIN Corp', cinGstin: 'NOT-A-CIN',
+    });
+    expect(badCin).toBe(400);
+
+    const goodCin = await registerViaOtp({
+      role: 'industry', name: 'E2E Ind Good', email: industryEmail, password: 'Ind@2026',
+      company: 'Good CIN Corp', cinGstin: 'L12345MH2020PLC123456',
+    });
+    expect(goodCin).toBe(200);
+    const vs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [industryEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('verified');
+
+    // Startup fallback: no CIN but an incorporation document → pending admin
+    const startupEmail = `e2e-startup-${stamp}@coolstartup.test`;
+    const startup = await registerViaOtp({
+      role: 'industry', name: 'E2E Startup', email: startupEmail, password: 'Ind@2026',
+      company: 'Cool Startup', incorporationDocument: '/uploads/verify/udyam-cert.png',
+    });
+    expect(startup).toBe(200);
+    const svs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [startupEmail]);
+    expect(svs.rows[0]?.verification_status).toBe('pending_admin_approval');
+    await pool.query(`DELETE FROM industries WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [startupEmail]).catch(() => {});
+    await pool.query(`DELETE FROM users WHERE LOWER(email) = $1`, [startupEmail]).catch(() => {});
+  });
+
+  dbIt('admin desk verifies a pending_admin_approval account', async () => {
+    const startupEmail = `e2e-adminverify-${stamp}@cooltwo.test`;
+    const startup = await registerViaOtp({
+      role: 'industry', name: 'E2E AdminVerify', email: startupEmail, password: 'Ind@2026',
+      company: 'Cool Two', incorporationDocument: '/uploads/verify/udyam-two.pdf',
+    });
+    expect(startup).toBe(200);
+
+    const queue = await request(app).get('/api/verify/admin-queue').set('Authorization', `Bearer ${adminToken}`);
+    expect(queue.status).toBe(200);
+    const acct = queue.body.accounts.find((a: any) => a.email === startupEmail);
+    expect(acct).toBeTruthy();
+
+    const approve = await request(app)
+      .patch(`/api/verify/admin-queue/${acct.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ decision: 'verified', reviewNote: 'Udyam certificate looks legit.' });
+    expect(approve.status).toBe(200);
+    const vs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [startupEmail]);
+    expect(vs.rows[0]?.verification_status).toBe('verified');
+    await pool.query(`DELETE FROM industries WHERE user_id = $1`, [acct.id]).catch(() => {});
+    await pool.query(`DELETE FROM users WHERE id = $1`, [acct.id]).catch(() => {});
+  });
+
+  dbIt('alumni registers with grad year + enrollment + LinkedIn, stays pending until the college vouches, then the mentor profile unlocks', async () => {
+    // Missing LinkedIn → 400
+    const noLinkedin = await registerViaOtp({
+      role: 'alumni', name: 'E2E Alum NoLink', email: `e2e-alumnl-${stamp}@spark.test`, password: 'Al@2026',
+      college: 'E2E Institute', graduationYear: 2019, enrollmentNumber: 'B2019001',
+    });
+    expect(noLinkedin).toBe(400);
+
+    // Missing enrollment → 400
+    const noEnrollment = await registerViaOtp({
+      role: 'alumni', name: 'E2E Alum NoEnr', email: `e2e-alumne-${stamp}@spark.test`, password: 'Al@2026',
+      college: 'E2E Institute', graduationYear: 2019, linkedinUrl: 'https://linkedin.com/in/e2e-alum-ne',
+    });
+    expect(noEnrollment).toBe(400);
+
+    // Good registration → pending application, no mentor record yet
+    const ok = await registerViaOtp({
+      role: 'alumni', name: 'E2E Alum', email: alumniEmail, password: 'Al@2026',
+      college: 'E2E Institute', graduationYear: 2019, enrollmentNumber: 'B2019042',
+      linkedinUrl: 'https://linkedin.com/in/e2e-alum-test', company: 'Mentor Corp',
+    });
+    expect(ok).toBe(200);
+    const vs = await pool.query(`SELECT id, verification_status FROM users WHERE LOWER(email) = $1`, [alumniEmail]);
+    alumniUserId = vs.rows[0]?.id;
+    expect(vs.rows[0]?.verification_status).toBe('pending_college_approval');
+    const appRow = await pool.query(`SELECT id FROM alumni_applications WHERE LOWER(email) = $1 ORDER BY created_at DESC LIMIT 1`, [alumniEmail]);
+    alumniAppId = appRow.rows[0]?.id;
+    expect(alumniAppId).toBeTruthy();
+    const noMentorYet = await pool.query(`SELECT id FROM alumni WHERE LOWER(email) = $1`, [alumniEmail]);
+    expect(noMentorYet.rows.length).toBe(0);
+
+    // Mentor profile is locked before approval
+    const locked = await request(app)
+      .patch('/api/alumni/mentor-profile')
+      .send({ isMentor: true, techStack: ['React'] }); // unauthenticated → 401 first
+    expect(locked.status).toBe(401);
+
+    // College vouches → mentor record minted, user verified
+    const vouch = await request(app)
+      .patch(`/api/verify/college-approvals/${alumniAppId}`)
+      .set('Authorization', `Bearer ${collegeToken}`)
+      .send({ decision: 'verified', kind: 'alumni' });
+    expect(vouch.status).toBe(200);
+
+    const afterVs = await pool.query(`SELECT verification_status FROM users WHERE LOWER(email) = $1`, [alumniEmail]);
+    expect(afterVs.rows[0]?.verification_status).toBe('verified');
+    const mentorRow = await pool.query(`SELECT id FROM alumni WHERE LOWER(email) = $1`, [alumniEmail]);
+    expect(mentorRow.rows.length).toBe(1);
+
+    // Enable mentor profile with company/role/tech stack
+    const alumLogin = await request(app).post('/api/login').send({ email: alumniEmail, password: 'Al@2026' });
+    const alumToken = alumLogin.body.token;
+    const enable = await request(app)
+      .patch('/api/alumni/mentor-profile')
+      .set('Authorization', `Bearer ${alumToken}`)
+      .send({ isMentor: true, mentorCapacity: 8, techStack: ['React', 'Kubernetes'], currentCompany: 'Mentor Corp HQ', currentRole: 'Staff Engineer' });
+    expect(enable.status).toBe(200);
+    expect(enable.body.profile.is_mentor).toBe(true);
+    expect(enable.body.profile.mentor_tech_stack).toEqual(['React', 'Kubernetes']);
+  });
+});
+
 // ── JOB OWNERSHIP + LIFECYCLE + PAGINATION ───────────────────────────────────
 describe('Job ownership, lifecycle & pagination', () => {
   let recruiterToken = '';
@@ -715,6 +963,12 @@ describe('Refresh tokens, revocation, offers, windows, collaborators, calendar',
 
   beforeAll(async () => {
     if (!dbAvailable) return;
+    // Verification-matrix suite burned auth buckets (OTP+logins from one IP);
+    // clear them so these login/refresh flows are not 429'd.
+    const { __resetAuthRateBucketsForTests } = await import('./index');
+    const { __resetRateLimitsForTests } = await import('./rateLimit');
+    __resetAuthRateBucketsForTests();
+    __resetRateLimitsForTests();
     const { hashPassword } = await import('./auth');
     const stamp = Date.now();
     for (const [suffix, name] of [[`own-${stamp}`, 'E2E Batch5 Own'], [`other-${stamp}`, 'E2E Batch5 Other']] as const) {

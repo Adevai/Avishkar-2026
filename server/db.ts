@@ -615,6 +615,8 @@ export async function initDatabase() {
       
       -- Verification Schema Extensions
       ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_status VARCHAR(32) DEFAULT 'pending';
+      ALTER TABLE students ADD COLUMN IF NOT EXISTS enrollment_number VARCHAR(64);
+      ALTER TABLE students ADD COLUMN IF NOT EXISTS prn VARCHAR(64);
 
       CREATE TABLE IF NOT EXISTS institutions (
           id VARCHAR(64) PRIMARY KEY,

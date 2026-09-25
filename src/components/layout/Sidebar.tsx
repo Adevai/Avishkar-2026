@@ -24,6 +24,7 @@ import {
   Inbox,
   MessageSquare,
   Zap,
+  BadgeCheck,
   Lock
 } from 'lucide-react';
 
@@ -49,6 +50,7 @@ export const Sidebar: React.FC = () => {
     { id: 'mous', label: 'Industry MoUs', icon: <Handshake className="w-4 h-4" /> },
     { id: 'placement-drives', label: 'Placement Drives', icon: <Briefcase className="w-4 h-4" /> },
     { id: 'alumni-desk', label: 'Alumni Verification Desk', icon: <GraduationCap className="w-4 h-4" /> },
+    { id: 'approvals', label: 'Approvals', icon: <BadgeCheck className="w-4 h-4" /> },
   ];
 
   const industryNav = [
