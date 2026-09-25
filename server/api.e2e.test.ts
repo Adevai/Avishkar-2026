@@ -849,6 +849,29 @@ describe('Interview scheduling (POST /applications/schedule-interviews)', () => 
     expect(row.rows[0].status).toBe('completed');
   });
 
+  dbIt('GET /recruiter/interview-slots: owner sees all slots with counts; non-owner sees none; cancel notifies the student', async () => {
+    const otherView = await request(app).get('/api/recruiter/interview-slots').set('Authorization', `Bearer ${otherToken}`);
+    expect(otherView.status).toBe(200);
+    expect(otherView.body.slots.length).toBe(0);
+
+    const mine = await request(app).get('/api/recruiter/interview-slots').set('Authorization', `Bearer ${recruiterToken}`);
+    expect(mine.status).toBe(200);
+    expect(mine.body.slots.length).toBe(3); // 2 from the first booking + 1 from the mixed one
+    expect(mine.body.counts.scheduled + mine.body.counts.completed + mine.body.counts.cancelled).toBe(3);
+    expect(mine.body.slots.every((s: any) => s.jobTitle === 'E2E Sched Role')).toBe(true);
+    expect(mine.body.slots[0]).toHaveProperty('applicationStatus');
+
+    // Cancel one scheduled slot → student notified in real time
+    const scheduled = mine.body.slots.find((s: any) => s.status === 'scheduled');
+    expect(scheduled).toBeTruthy();
+    const cancel = await request(app).patch(`/api/interview-slots/${scheduled.id}`).set('Authorization', `Bearer ${recruiterToken}`).send({ status: 'cancelled' });
+    expect(cancel.status).toBe(200);
+    const notif = await pool.query(`SELECT title, message FROM notifications WHERE user_id = $1 AND title = 'Interview Cancelled' ORDER BY created_at DESC LIMIT 1`, [scheduled.studentId]);
+    expect(notif.rows.length).toBe(1);
+    expect(String(notif.rows[0].message)).toMatch(/cancelled by the recruiter/i);
+    await pool.query(`DELETE FROM notifications WHERE user_id = $1 AND title = 'Interview Cancelled'`, [scheduled.studentId]);
+  });
+
   dbIt('GET /me/interview-slots: student sees only their own booked slots with full details', async () => {
     // A student with a linked login account, their application, and a real booking.
     const stamp = Date.now();
@@ -1015,6 +1038,11 @@ describe('Recruiter funnel (GET /recruiter/funnel)', () => {
     const trendTotal = mine.body.weeklyTrend.reduce((sum: number, w: any) => sum + w.applications, 0);
     expect(trendTotal).toBe(7);
     expect(mine.body.weeklyTrend.every((w: any) => /^\d{4}-\d{2}-\d{2}$/.test(w.week))).toBe(true);
+
+    // Drill-down: each posting carries its own weekly trend, summing to its totals
+    expect(Array.isArray(a.weeklyTrend)).toBe(true);
+    expect(a.weeklyTrend.reduce((s: number, w: any) => s + w.applications, 0)).toBe(6);
+    expect(b.weeklyTrend.reduce((s: number, w: any) => s + w.applications, 0)).toBe(1);
 
     // The other recruiter's funnel must not include these postings
     const theirs = await request(app).get('/api/recruiter/funnel').set('Authorization', `Bearer ${otherToken}`);

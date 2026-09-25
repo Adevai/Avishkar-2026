@@ -269,6 +269,172 @@ export async function sendRegistrationOtpEmail({
   }
 }
 
+function icsEscape(text: string): string {
+  return String(text)
+    .replace(/\\/g, '\\\\')
+    .replace(/;/g, '\\;')
+    .replace(/,/g, '\\,')
+    .replace(/\r?\n/g, '\\n');
+}
+
+function icsBasicUtc(iso: string): string {
+  return new Date(iso).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+/**
+ * RFC 5545 calendar invite for an interview slot. Imported into Google
+ * Calendar / Outlook / Apple Calendar with a 1-hour display alarm.
+ */
+export function buildInterviewIcs(params: {
+  slotId: string;
+  jobTitle: string;
+  company: string;
+  scheduledAt: string;
+  durationMinutes: number;
+  mode: string;
+  meetingUrl?: string | null;
+  notes?: string | null;
+}): string {
+  const start = new Date(params.scheduledAt);
+  const end = new Date(start.getTime() + (params.durationMinutes || 45) * 60_000);
+  const modeLabel = params.mode === 'in-person' ? 'In-person' : params.mode === 'phone' ? 'Phone call' : 'Online';
+  const descriptionLines = [
+    `${modeLabel} interview for ${params.jobTitle} at ${params.company}.`,
+    params.meetingUrl ? `Join: ${params.meetingUrl}` : '',
+    params.notes ? `Notes: ${params.notes}` : '',
+  ].filter(Boolean);
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//S.P.A.R.K.//Interview Scheduler//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    'BEGIN:VEVENT',
+    `UID:${icsEscape(params.slotId)}@interviews.spark`,
+    `DTSTAMP:${icsBasicUtc(new Date().toISOString())}`,
+    `DTSTART:${icsBasicUtc(start.toISOString())}`,
+    `DTEND:${icsBasicUtc(end.toISOString())}`,
+    `SUMMARY:${icsEscape(`Interview — ${params.jobTitle} @ ${params.company}`)}`,
+    `DESCRIPTION:${icsEscape(descriptionLines.join('\n'))}`,
+    `LOCATION:${icsEscape(params.meetingUrl || modeLabel)}`,
+    'STATUS:CONFIRMED',
+    'BEGIN:VALARM',
+    'TRIGGER:-PT1H',
+    'ACTION:DISPLAY',
+    `DESCRIPTION:${icsEscape(`Interview in 1 hour — ${params.jobTitle} @ ${params.company}`)}`,
+    'END:VALARM',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].join('\r\n') + '\r\n';
+}
+
+export async function sendInterviewConfirmationEmail({
+  toEmail,
+  userName = 'there',
+  jobTitle,
+  company,
+  scheduledAt,
+  durationMinutes,
+  mode,
+  meetingUrl,
+  notes,
+  ics,
+}: {
+  toEmail: string;
+  userName?: string;
+  jobTitle: string;
+  company: string;
+  scheduledAt: string;
+  durationMinutes: number;
+  mode: string;
+  meetingUrl?: string;
+  notes?: string;
+  ics: string;
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const when = new Date(scheduledAt);
+  const whenLabel = when.toLocaleString('en-IN', {
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata',
+  });
+  const modeLabel = mode === 'in-person' ? 'In-person' : mode === 'phone' ? 'Phone call' : 'Online';
+  const meetingBlock = meetingUrl
+    ? `<p style="margin:0 0 12px 0;"><a href="${meetingUrl}" style="display:inline-block;padding:12px 24px;background:#2563eb;color:#ffffff;border-radius:12px;font-size:13px;font-weight:700;text-decoration:none;">Join the meeting →</a></p>`
+    : '';
+  const notesBlock = notes
+    ? `<div style="margin:14px 0 0 0;padding:12px;background:#1e293b;border-radius:10px;font-size:12px;color:#94a3b8;"><strong style="color:#cbd5e1;">Notes from the recruiter:</strong> ${notes}</div>`
+    : '';
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head><meta charset="UTF-8"><title>S.P.A.R.K. Interview Invitation</title></head>
+    <body style="margin:0;padding:0;background-color:#0b0f19;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+      <table border="0" cellpadding="0" cellspacing="0" width="100%">
+        <tr>
+          <td align="center" style="padding:40px 10px;">
+            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:560px;background-color:#131b2e;border:1px solid #1e293b;border-radius:24px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 36px;background:linear-gradient(135deg,#1e3a8a 0%,#1e1b4b 100%);border-bottom:1px solid rgba(255,255,255,0.1);">
+                  <div style="display:inline-block;padding:6px 14px;background:rgba(59,130,246,0.2);border:1px solid rgba(96,165,250,0.4);border-radius:100px;color:#93c5fd;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">
+                    Interview Invitation
+                  </div>
+                  <h1 style="margin:14px 0 4px 0;color:#ffffff;font-size:22px;font-weight:800;">You have an interview scheduled</h1>
+                  <p style="margin:0;color:#cbd5e1;font-size:12px;">S.P.A.R.K. Interview Scheduler</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:36px;">
+                  <p style="margin:0 0 16px 0;color:#e2e8f0;font-size:15px;">Hello <strong style="color:#60a5fa;">${userName}</strong>,</p>
+                  <p style="margin:0 0 20px 0;color:#94a3b8;font-size:14px;line-height:1.6;">
+                    Great news — a recruiter has booked your interview slot:
+                  </p>
+                  <div style="margin:0 0 20px 0;padding:20px;background:#0b0f19;border:1px solid #1e293b;border-radius:14px;">
+                    <div style="color:#e2e8f0;font-size:16px;font-weight:800;">${jobTitle}</div>
+                    <div style="color:#94a3b8;font-size:12px;margin:2px 0 14px 0;">${company}</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">🗓 <strong>${whenLabel}</strong> (IST)</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">⏱ ${durationMinutes} minutes</div>
+                    <div style="color:#cbd5e1;font-size:13px;margin:4px 0;">📍 ${modeLabel}</div>
+                  </div>
+                  ${meetingBlock}
+                  ${notesBlock}
+                  <p style="margin:20px 0 0 0;color:#64748b;font-size:12px;line-height:1.6;">
+                    The calendar invite (.ics) is attached — add it to Google Calendar, Outlook, or Apple Calendar so the slot lands in your schedule automatically.
+                  </p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:20px 36px;background-color:#0b0f19;border-top:1px solid #1e293b;text-align:center;">
+                  <p style="margin:0;color:#64748b;font-size:11px;">© ${new Date().getFullYear()} S.P.A.R.K. • Automated interview invitation</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"S.P.A.R.K. Interview Scheduler" <${EMAIL_USER}>`,
+      to: toEmail,
+      subject: `[S.P.A.R.K.] Interview invitation: ${jobTitle} @ ${company} — ${whenLabel} (IST)`,
+      text: `Hi ${userName}, your interview for ${jobTitle} at ${company} is booked for ${whenLabel} (IST), ${durationMinutes} min, ${modeLabel}.${meetingUrl ? ` Join: ${meetingUrl}` : ''}${notes ? ` Notes: ${notes}` : ''} Calendar invite attached.`,
+      html: htmlContent,
+      attachments: [{ filename: 'interview-invite.ics', content: ics, contentType: 'text/calendar; charset=utf-8; method=PUBLISH' }],
+    });
+    console.log(`[EmailService] Interview confirmation dispatched to ${toEmail}`);
+    return { success: true, messageId: info.messageId };
+  } catch (error: any) {
+    console.error(`[EmailService] Failed to send interview confirmation to ${toEmail}:`, error.message);
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn(`[EmailService] DEV MODE interview confirmation for ${toEmail}: ${jobTitle} @ ${company}, ${scheduledAt}`);
+      return { success: true, error: `SMTP unavailable — dev fallback active (${error.message})` };
+    }
+    return { success: false, error: error.message };
+  }
+}
+
 export async function sendInterviewReminderEmail({
   toEmail,
   userName = 'there',
@@ -280,6 +446,7 @@ export async function sendInterviewReminderEmail({
   meetingUrl,
   notes,
   kind,
+  ics,
 }: {
   toEmail: string;
   userName?: string;
@@ -291,6 +458,7 @@ export async function sendInterviewReminderEmail({
   meetingUrl?: string;
   notes?: string;
   kind: '24h' | '2h';
+  ics?: string;
 }): Promise<{ success: boolean; messageId?: string; error?: string }> {
   const when = new Date(scheduledAt);
   const whenLabel = when.toLocaleString('en-IN', {
@@ -365,6 +533,7 @@ export async function sendInterviewReminderEmail({
       subject: `[S.P.A.R.K.] ${kind === '2h' ? '⏰ Starting soon:' : '📅 Reminder:'} your ${company} interview ${countdown}`,
       text: `Hi ${userName}, your interview for ${jobTitle} at ${company} is ${countdown} — ${whenLabel} (IST), ${durationMinutes} min, ${modeLabel}.${meetingUrl ? ` Join: ${meetingUrl}` : ''}${notes ? ` Notes: ${notes}` : ''}`,
       html: htmlContent,
+      attachments: ics ? [{ filename: 'interview-invite.ics', content: ics, contentType: 'text/calendar; charset=utf-8; method=PUBLISH' }] : undefined,
     });
     console.log(`[EmailService] Interview ${kind} reminder dispatched to ${toEmail}`);
     return { success: true, messageId: info.messageId };

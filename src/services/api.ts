@@ -307,6 +307,12 @@ export const api = {
     return await res.json();
   },
 
+  async getRecruiterInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[]; counts: { scheduled: number; completed: number; cancelled: number } }> {
+    const res = await authFetch(`${API_BASE}/recruiter/interview-slots`);
+    if (!res.ok) throw new Error('Failed to fetch the interview schedule');
+    return await res.json();
+  },
+
   async updateInterviewSlot(slotId: string, status: 'completed' | 'cancelled'): Promise<{ success: boolean; slot: { id: string; status: string } }> {
     const res = await authFetch(`${API_BASE}/interview-slots/${slotId}`, {
       method: 'PATCH',

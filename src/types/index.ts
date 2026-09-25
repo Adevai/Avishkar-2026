@@ -307,6 +307,8 @@ export interface InterviewSlot {
   jobTitle?: string;
   company?: string;
   location?: string;
+  // Populated on the recruiter-facing /recruiter/interview-slots payload
+  applicationStatus?: string;
   scheduledAt: string;
   durationMinutes: number;
   mode: InterviewMode;
@@ -326,6 +328,8 @@ export interface FunnelPosting {
   offers: number;
   rejected: number;
   conversionPct: number;
+  // Drill-down: this posting's own weekly application trend.
+  weeklyTrend: { week: string; applications: number }[];
 }
 
 export interface RecruiterFunnelResponse {

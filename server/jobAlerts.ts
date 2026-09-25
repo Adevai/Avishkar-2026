@@ -154,7 +154,7 @@ export async function sendJobAlertDigest(): Promise<{ emailed: number; skipped: 
 // ═════════════════════════════════════════════════════════════════════
 
 export async function sendInterviewReminders(): Promise<{ sent24h: number; sent2h: number }> {
-  const { sendInterviewReminderEmail } = await import('./emailService');
+  const { sendInterviewReminderEmail, buildInterviewIcs } = await import('./emailService');
   let sent24h = 0;
   let sent2h = 0;
 
@@ -182,6 +182,16 @@ export async function sendInterviewReminders(): Promise<{ sent24h: number; sent2
       meetingUrl: slot.meeting_url || undefined,
       notes: slot.notes || undefined,
       kind,
+      ics: buildInterviewIcs({
+        slotId: slot.id,
+        jobTitle: slot.job_title,
+        company: slot.company,
+        scheduledAt: new Date(slot.scheduled_at).toISOString(),
+        durationMinutes: slot.duration_minutes || 45,
+        mode: slot.mode || 'online',
+        meetingUrl: slot.meeting_url,
+        notes: slot.notes,
+      }),
     });
     if (!result.success) return false;
 

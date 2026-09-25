@@ -6,7 +6,7 @@ import { ASSESSMENT_QUESTIONS, COLLEGE_DEPARTMENT_STATS, GOVT_REGIONAL_STATS, EM
 import { calculateJobMatch } from '../src/utils/matchCalculator';
 import { askCopilot } from '../src/utils/geminiService';
 import { extractSkillsFromText } from './nlpEngine';
-import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail } from './emailService';
+import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail, buildInterviewIcs, sendInterviewConfirmationEmail } from './emailService';
 import { hashPassword, comparePassword, signToken, requireAuth } from './auth';
 import { verifyInstitutionServer } from './institutionVerify';
 import { aggregateJobs } from './jobAggregator';
@@ -1279,6 +1279,41 @@ router.post('/applications/schedule-interviews', requireAuth, async (req: Reques
         targetUserId: uid,
         data: { applicationId: app.id, jobId: app.job_id, scheduledAt: when.toISOString(), mode: interviewMode },
       });
+
+      // Best-effort invitation email with an RFC 5545 .ics attachment so the
+      // slot lands in the candidate's Google/Outlook/Apple calendar.
+      (async () => {
+        const em = await query(
+          `SELECT COALESCE(u.email, s.email) AS email, COALESCE(s.name, split_part(COALESCE(u.email, s.email), '@', 1)) AS name
+             FROM students s LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.id = $1`,
+          [app.student_id]
+        ).catch(() => ({ rows: [] as any[] }));
+        const to = em.rows[0]?.email;
+        if (!to) return;
+        const ics = buildInterviewIcs({
+          slotId,
+          jobTitle: app.job_title,
+          company: app.company,
+          scheduledAt: when.toISOString(),
+          durationMinutes: duration,
+          mode: interviewMode,
+          meetingUrl: meetingUrl || null,
+          notes: notes || null,
+        });
+        await sendInterviewConfirmationEmail({
+          toEmail: to,
+          userName: em.rows[0].name,
+          jobTitle: app.job_title,
+          company: app.company,
+          scheduledAt: when.toISOString(),
+          durationMinutes: duration,
+          mode: interviewMode,
+          meetingUrl: meetingUrl || undefined,
+          notes: notes || undefined,
+          ics,
+        });
+      })().catch(err => console.error('interview confirmation email failed:', err.message));
     }
 
     res.status(201).json({ success: true, scheduled: slotRows.length, slots: slotRows });
@@ -1322,7 +1357,7 @@ router.get('/jobs/:jobId/interview-slots', requireAuth, async (req: Request, res
   }
 });
 
-// ── Update a slot (owner-only): mark completed / cancel ──
+// ── Update a slot (owner-only): mark completed / cancel, notify the student ──
 router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: Response) => {
   const { status } = req.body || {};
   if (!['completed', 'cancelled'].includes(status)) {
@@ -1339,10 +1374,81 @@ router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Slot not found (or you do not own its job).' });
     }
-    res.json({ success: true, slot: { id: result.rows[0].id, status: result.rows[0].status } });
+    const slot = result.rows[0];
+
+    // Best-effort: tell the student the interview was completed or cancelled.
+    const detail = await query(
+      `SELECT j.title AS job_title, j.company FROM interview_slots s JOIN jobs j ON j.id = s.job_id WHERE s.id = $1`,
+      [slot.id]
+    );
+    const jobTitle = detail.rows[0]?.job_title || 'your interview';
+    const company = detail.rows[0]?.company || '';
+    const uidRes = await query(
+      `SELECT u.id FROM users u WHERE u.id = (SELECT user_id FROM students WHERE id = $1)`,
+      [slot.student_id]
+    ).catch(() => ({ rows: [] as any[] }));
+    const uid = uidRes.rows[0]?.id || slot.student_id;
+    const title = status === 'completed' ? 'Interview Completed' : 'Interview Cancelled';
+    const message = status === 'completed'
+      ? `Your interview for ${jobTitle} at ${company} was marked completed. Results will follow soon.`
+      : `Your interview for ${jobTitle} at ${company} scheduled for ${new Date(slot.scheduled_at).toLocaleString()} was cancelled by the recruiter.`;
+    await query(
+      `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
+      [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, title, message, status === 'completed' ? 'success' : 'alert']
+    ).catch(() => {});
+    emitEvent({ type: 'application_update', title, message, targetUserId: uid, data: { slotId: slot.id, status } });
+
+    res.json({ success: true, slot: { id: slot.id, status: slot.status, jobTitle, company } });
   } catch (error: any) {
     console.error('interview-slot update failed:', error.message);
     res.status(500).json({ error: 'Failed to update interview slot.' });
+  }
+});
+
+// ── Interview Schedule board (owner-only): every slot across own postings ──
+router.get('/recruiter/interview-slots', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const recruiter = (req as any).user;
+    // Real rows only: slots joined to jobs posted_by this recruiter, enriched
+    // with the candidate's application stage so the board is actionable.
+    const result = await query(
+      `SELECT s.id, s.application_id, s.job_id, s.student_id, s.scheduled_at,
+              s.duration_minutes, s.mode, s.meeting_url, s.notes, s.status, s.created_at,
+              j.title AS job_title, j.company,
+              a.student_name, a.status AS application_status
+         FROM interview_slots s
+         JOIN jobs j ON j.id = s.job_id
+         LEFT JOIN applications a ON a.id = s.application_id
+        WHERE j.posted_by = $1
+        ORDER BY (s.status = 'scheduled') DESC, s.scheduled_at ASC`,
+      [recruiter.sub]
+    );
+    const slots = result.rows.map(r => ({
+      id: r.id,
+      applicationId: r.application_id,
+      jobId: r.job_id,
+      jobTitle: r.job_title,
+      company: r.company,
+      studentId: r.student_id,
+      studentName: r.student_name || r.student_id,
+      applicationStatus: r.application_status,
+      scheduledAt: r.scheduled_at,
+      durationMinutes: r.duration_minutes,
+      mode: r.mode,
+      meetingUrl: r.meeting_url,
+      notes: r.notes,
+      status: r.status,
+      createdAt: r.created_at,
+    }));
+    const counts = {
+      scheduled: slots.filter(s => s.status === 'scheduled').length,
+      completed: slots.filter(s => s.status === 'completed').length,
+      cancelled: slots.filter(s => s.status === 'cancelled').length,
+    };
+    res.json({ success: true, slots, counts });
+  } catch (error: any) {
+    console.error('recruiter interview-slots failed:', error.message);
+    res.status(500).json({ error: 'Failed to load the interview schedule.' });
   }
 });
 
@@ -1365,14 +1471,19 @@ router.get('/recruiter/funnel', requireAuth, async (req: Request, res: Response)
       [recruiter.sub]
     );
     const trend = await query(
-      `SELECT to_char(date_trunc('week', a.applied_date), 'YYYY-MM-DD') AS week, count(*)::int AS applications
+      `SELECT j.id AS job_id, to_char(date_trunc('week', a.applied_date), 'YYYY-MM-DD') AS week, count(*)::int AS applications
          FROM applications a
          JOIN jobs j ON j.id = a.job_id
         WHERE j.posted_by = $1
-        GROUP BY 1
-        ORDER BY 1 ASC`,
+        GROUP BY 1, 2
+        ORDER BY 2 ASC`,
       [recruiter.sub]
     );
+    const trendByJob = new Map<string, { week: string; applications: number }[]>();
+    for (const r of trend.rows) {
+      if (!trendByJob.has(r.job_id)) trendByJob.set(r.job_id, []);
+      trendByJob.get(r.job_id)!.push({ week: r.week, applications: Number(r.applications) });
+    }
     const postings = perJob.rows.map(r => {
       const applied = Number(r.applied) || 0;
       const offers = Number(r.offers) || 0;
@@ -1386,9 +1497,18 @@ router.get('/recruiter/funnel', requireAuth, async (req: Request, res: Response)
         offers,
         rejected: Number(r.rejected) || 0,
         conversionPct: applied > 0 ? Math.round((offers / applied) * 1000) / 10 : 0,
+        // Drill-down: this posting's own weekly application trend.
+        weeklyTrend: trendByJob.get(r.job_id) || [],
       };
     });
-    res.json({ success: true, postings, weeklyTrend: trend.rows.map(r => ({ week: r.week, applications: Number(r.applications) })) });
+    const aggregateTrend = trend.rows.reduce<{ week: string; applications: number }[]>((acc, r) => {
+      const week = r.week;
+      const existing = acc.find(w => w.week === week);
+      if (existing) existing.applications += Number(r.applications);
+      else acc.push({ week, applications: Number(r.applications) });
+      return acc;
+    }, []);
+    res.json({ success: true, postings, weeklyTrend: aggregateTrend });
   } catch (error: any) {
     console.error('recruiter funnel failed:', error.message);
     res.status(500).json({ error: 'Failed to compute funnel analytics.' });
