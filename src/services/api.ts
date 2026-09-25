@@ -307,6 +307,15 @@ export const api = {
     return await res.json();
   },
 
+  async resendInterviewInvite(slotId: string): Promise<{ success: boolean; resentTo: string; error?: string }> {
+    const res = await authFetch(`${API_BASE}/interview-slots/${slotId}/resend-invite`, { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to resend the invitation');
+    }
+    return await res.json();
+  },
+
   async getRecruiterInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[]; counts: { scheduled: number; completed: number; cancelled: number } }> {
     const res = await authFetch(`${API_BASE}/recruiter/interview-slots`);
     if (!res.ok) throw new Error('Failed to fetch the interview schedule');
@@ -327,6 +336,16 @@ export const api = {
     const res = await authFetch(`${API_BASE}/recruiter/funnel`);
     if (!res.ok) throw new Error('Failed to fetch funnel analytics');
     return await res.json();
+  },
+
+  getInterviewSlotIcsUrl(slotId: string): string {
+    return `${API_BASE}/interview-slots/${slotId}/ics`;
+  },
+
+  async getInterviewSlotIcs(slotId: string): Promise<Blob> {
+    const res = await authFetch(`${API_BASE}/interview-slots/${slotId}/ics`);
+    if (!res.ok) throw new Error('Failed to download the calendar invite');
+    return await res.blob();
   },
 
   async getMyInterviewSlots(): Promise<{ success: boolean; slots: InterviewSlot[] }> {

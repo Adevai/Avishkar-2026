@@ -616,11 +616,28 @@ export const IndustryDashboard: React.FC = () => {
                         <td className="py-3 px-3">
                           <p className="font-semibold text-slate-700">{slot.jobTitle}</p>
                         </td>
-                        <td className="py-3 px-3">{slot.meetingUrl ? (
-                          <a href={slot.meetingUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline font-semibold">Join link</a>
-                        ) : (
-                          <span className="text-slate-500">{slot.mode === 'in-person' ? 'In-person' : slot.mode === 'phone' ? 'Phone' : 'Online'}</span>
-                        )}</td>
+                        <td className="py-3 px-3">
+                          {slot.meetingUrl ? (
+                            <a href={slot.meetingUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline font-semibold">Join link</a>
+                          ) : (
+                            <span className="text-slate-500">{slot.mode === 'in-person' ? 'In-person' : slot.mode === 'phone' ? 'Phone' : 'Online'}</span>
+                          )}
+                          {slot.status === 'scheduled' && (
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const r = await api.resendInterviewInvite(slot.id);
+                                  setNotification(r.success ? `Invitation re-sent to ${r.resentTo}.` : (r.error || 'Resend failed.'));
+                                } catch (e: any) {
+                                  setNotification(e?.message || 'Resend failed.');
+                                }
+                              }}
+                              className="block mt-1 text-[10px] font-bold text-slate-500 hover:text-blue-700"
+                            >
+                              ↻ Resend invite
+                            </button>
+                          )}
+                        </td>
                         <td className="py-3 px-3">
                           <span className={`px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase tracking-wider ${
                             slot.status === 'scheduled' ? 'bg-indigo-600 text-white'

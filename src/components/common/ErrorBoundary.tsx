@@ -1,63 +1,51 @@
 import React from 'react';
-import { AlertTriangle, RotateCcw, Home } from 'lucide-react';
 
 interface State {
   hasError: boolean;
-  error?: Error;
+  message?: string;
 }
 
 /**
- * Global Error Boundary — wraps the app so an unexpected render error
- * shows a branded recovery screen instead of a blank white page.
+ * Catches render-time errors anywhere below it and shows a recoverable
+ * panel instead of a white screen. Users can reload or return home.
  */
 export class ErrorBoundary extends React.Component<{ children: React.ReactNode }, State> {
   state: State = { hasError: false };
 
   static getDerivedStateFromError(error: Error): State {
-    return { hasError: true, error };
+    return { hasError: true, message: error?.message };
   }
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
-    // Hook for Sentry/observability in production
-    console.error('[ErrorBoundary]', error.message, info.componentStack);
+    console.error('[ErrorBoundary]', error?.message, info?.componentStack);
   }
 
   render() {
-    if (this.state.hasError) {
-      return (
-        <div className="min-h-screen bg-ivory flex items-center justify-center p-6">
-          <div className="premium-card max-w-md w-full p-8 text-center">
-            <div className="inline-flex p-3.5 rounded-2xl bg-amber-50 border border-amber-200 mb-4">
-              <AlertTriangle className="w-7 h-7 text-amber-600" />
-            </div>
-            <h1 className="display-3 text-ink-900">Something went wrong</h1>
-            <p className="text-sm text-ink-500 mt-2">
-              An unexpected error interrupted this view. Your data is safe — reloading usually fixes it.
-            </p>
-            {this.state.error && (
-              <p className="mt-3 text-[11px] font-mono text-ink-400 bg-ivory-deep border border-ink-900/[0.06] rounded-xl p-3 break-words text-left">
-                {this.state.error.message}
-              </p>
-            )}
-            <div className="flex gap-2.5 mt-6">
-              <button
-                onClick={() => window.location.reload()}
-                className="btn-gold flex-1"
-              >
-                <RotateCcw className="w-4 h-4" /> Reload
-              </button>
-              <button
-                onClick={() => { window.location.href = '/'; }}
-                className="btn-ghost flex-1"
-              >
-                <Home className="w-4 h-4" /> Home
-              </button>
-            </div>
+    if (!this.state.hasError) return this.props.children;
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center p-8">
+        <div className="max-w-md w-full bg-white rounded-3xl p-8 border border-rose-200 shadow-md text-center space-y-3">
+          <div className="text-3xl">⚠️</div>
+          <h2 className="text-lg font-bold text-slate-900">Something went wrong</h2>
+          <p className="text-xs text-slate-500">
+            {this.state.message || 'An unexpected error occurred while rendering this section.'}
+          </p>
+          <div className="flex items-center justify-center gap-2 pt-2">
+            <button
+              onClick={() => window.location.reload()}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs"
+            >
+              ↻ Reload
+            </button>
+            <a
+              href="/"
+              className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-xs"
+            >
+              Go home
+            </a>
           </div>
         </div>
-      );
-    }
-
-    return this.props.children;
+      </div>
+    );
   }
-};
+}

@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { SAMPLE_STUDENTS } from '../../data/mockData';
 import { api } from '../../services/api';
 import { StudentProfile } from '../../types';
 import { 
@@ -22,29 +21,33 @@ export const CollegeStudentDirectory: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedBranch, setSelectedBranch] = useState('All');
 
-  // Live student registry from PostgreSQL, with curated fallback for offline demos
-  const [students, setStudents] = useState<StudentProfile[]>(SAMPLE_STUDENTS);
+  // Live student registry from PostgreSQL — no fake fallback rows.
+  const [students, setStudents] = useState<StudentProfile[]>([]);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadStudents = () => {
+    setIsLoading(true);
+    setLoadError(null);
     let cancelled = false;
     api.getStudents()
       .then(data => {
         if (cancelled) return;
-        if (data && data.length > 0) {
-          setStudents(data);
-          setIsLive(true);
-        }
+        setStudents(data || []);
+        setIsLive(true);
       })
-      .catch(() => {
-        // Keep the curated fallback registry silently
+      .catch((e: any) => {
+        if (cancelled) return;
+        setLoadError(e?.message || 'Failed to load the student registry.');
       })
       .finally(() => {
         if (!cancelled) setIsLoading(false);
       });
     return () => { cancelled = true; };
-  }, []);
+  };
+
+  useEffect(() => loadStudents(), []);
 
   const filtered = students.filter(s => {
     if (selectedBranch !== 'All' && !s.branch.includes(selectedBranch)) return false;
@@ -78,7 +81,7 @@ export const CollegeStudentDirectory: React.FC = () => {
                 : 'bg-slate-50 text-slate-500 border-slate-200'
             }`}>
               <Radio className={`w-3 h-3 ${isLive ? 'text-emerald-600 animate-pulse' : 'text-slate-400'}`} />
-              <span>{isLoading ? 'Syncing registry…' : isLive ? 'Live institutional registry' : 'Offline demo registry'}</span>
+              <span>{isLoading ? 'Syncing registry…' : loadError ? 'Connection error' : isLive ? 'Live institutional registry' : 'No students yet'}</span>
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
@@ -125,6 +128,30 @@ export const CollegeStudentDirectory: React.FC = () => {
       </div>
 
       {/* Students Table */}
+      {isLoading ? (
+        <div className="bg-white rounded-2xl p-12 border border-slate-200/80 shadow-xs text-center">
+          <RefreshCw className="w-8 h-8 text-blue-500 animate-spin mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-700">Loading student registry…</p>
+        </div>
+      ) : loadError ? (
+        <div className="bg-white rounded-2xl p-12 border border-rose-200 shadow-xs text-center">
+          <ShieldCheck className="w-8 h-8 text-rose-500 mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-800">Could not load students</p>
+          <p className="text-xs text-slate-500 mt-1">{loadError}</p>
+          <button
+            onClick={loadStudents}
+            className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs"
+          >
+            ↻ Retry
+          </button>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="bg-white rounded-2xl p-12 border border-slate-200/80 shadow-xs text-center">
+          <Users className="w-8 h-8 text-slate-300 mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-700">No students match your filters</p>
+          <p className="text-xs text-slate-400 mt-1">Adjust the branch filter or clear the search to see the full registry.</p>
+        </div>
+      ) : (
       <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
@@ -209,6 +236,7 @@ export const CollegeStudentDirectory: React.FC = () => {
           </table>
         </div>
       </div>
+      )}
     </div>
   );
 };

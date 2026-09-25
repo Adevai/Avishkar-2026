@@ -7,6 +7,8 @@ import { calculateJobMatch } from '../src/utils/matchCalculator';
 import { askCopilot } from '../src/utils/geminiService';
 import { extractSkillsFromText } from './nlpEngine';
 import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail, buildInterviewIcs, sendInterviewConfirmationEmail } from './emailService';
+import { getCollegeDepartmentStats, getGovtRegionalStats, getEmergingSkillTrends } from './analytics';
+import { checkRateLimit, clientIpOf } from './rateLimit';
 import { hashPassword, comparePassword, signToken, requireAuth } from './auth';
 import { verifyInstitutionServer } from './institutionVerify';
 import { aggregateJobs } from './jobAggregator';
@@ -1268,9 +1270,10 @@ router.post('/applications/schedule-interviews', requireAuth, async (req: Reques
         [app.student_id]
       ).catch(() => ({ rows: [] as any[] }));
       const uid = uidRes.rows[0]?.id || app.student_id;
+      const istLabel = when.toLocaleString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
       await query(
         `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
-        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, 'Interview Scheduled', `Your interview for ${app.job_title} at ${app.company} is booked for ${whenLabel} (${interviewMode}).`, 'success']
+        [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, 'Interview Scheduled', `Your interview for ${app.job_title} at ${app.company} is booked for ${istLabel} IST (${interviewMode}).`, 'success']
       ).catch(() => {});
       emitEvent({
         type: 'application_update',
@@ -1391,7 +1394,7 @@ router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: 
     const title = status === 'completed' ? 'Interview Completed' : 'Interview Cancelled';
     const message = status === 'completed'
       ? `Your interview for ${jobTitle} at ${company} was marked completed. Results will follow soon.`
-      : `Your interview for ${jobTitle} at ${company} scheduled for ${new Date(slot.scheduled_at).toLocaleString()} was cancelled by the recruiter.`;
+      : `Your interview for ${jobTitle} at ${company} scheduled for ${new Date(slot.scheduled_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST was cancelled by the recruiter.`;
     await query(
       `INSERT INTO notifications (id, user_id, title, message, type) VALUES ($1, $2, $3, $4, $5)`,
       [`notif-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, uid, title, message, status === 'completed' ? 'success' : 'alert']
@@ -1402,6 +1405,97 @@ router.patch('/interview-slots/:slotId', requireAuth, async (req: Request, res: 
   } catch (error: any) {
     console.error('interview-slot update failed:', error.message);
     res.status(500).json({ error: 'Failed to update interview slot.' });
+  }
+});
+
+// ── Download the .ics invite for a slot (the slot's student or the job owner) ──
+router.get('/interview-slots/:slotId/ics', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const r = await query(
+      `SELECT s.id, s.scheduled_at, s.duration_minutes, s.mode, s.meeting_url, s.notes,
+              s.student_id, j.title AS job_title, j.company, j.posted_by
+         FROM interview_slots s JOIN jobs j ON j.id = s.job_id
+        WHERE s.id = $1`,
+      [req.params.slotId]
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'Slot not found.' });
+    }
+    const slot = r.rows[0];
+    const ownerRes = await query(`SELECT user_id FROM students WHERE id = $1`, [slot.student_id]);
+    const isStudentOwner = ownerRes.rows[0]?.user_id === user.sub;
+    const isJobOwner = slot.posted_by === user.sub;
+    if (!isStudentOwner && !isJobOwner) {
+      return res.status(403).json({ error: 'This interview does not belong to you.' });
+    }
+    const ics = buildInterviewIcs({
+      slotId: slot.id,
+      jobTitle: slot.job_title,
+      company: slot.company,
+      scheduledAt: new Date(slot.scheduled_at).toISOString(),
+      durationMinutes: slot.duration_minutes || 45,
+      mode: slot.mode || 'online',
+      meetingUrl: slot.meeting_url,
+      notes: slot.notes,
+    });
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="interview-invite.ics"');
+    res.send(ics);
+  } catch (error: any) {
+    console.error('slot ICS download failed:', error.message);
+    res.status(500).json({ error: 'Failed to generate the calendar invite.' });
+  }
+});
+
+// ── Resend the invitation email (job owner only) ──
+router.post('/interview-slots/:slotId/resend-invite', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const r = await query(
+      `SELECT s.*, j.title AS job_title, j.company
+         FROM interview_slots s JOIN jobs j ON j.id = s.job_id
+        WHERE s.id = $1 AND j.posted_by = $2`,
+      [req.params.slotId, user.sub]
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: 'Slot not found (or you do not own its job).' });
+    }
+    const slot = r.rows[0];
+    const em = await query(
+      `SELECT COALESCE(u.email, s2.email) AS email, COALESCE(s2.name, split_part(COALESCE(u.email, s2.email), '@', 1)) AS name
+         FROM students s2 LEFT JOIN users u ON u.id = s2.user_id
+        WHERE s2.id = $1`,
+      [slot.student_id]
+    );
+    const to = em.rows[0]?.email;
+    if (!to) return res.status(409).json({ error: 'This candidate has no linked email account.' });
+    const ics = buildInterviewIcs({
+      slotId: slot.id,
+      jobTitle: slot.job_title,
+      company: slot.company,
+      scheduledAt: new Date(slot.scheduled_at).toISOString(),
+      durationMinutes: slot.duration_minutes || 45,
+      mode: slot.mode || 'online',
+      meetingUrl: slot.meeting_url,
+      notes: slot.notes,
+    });
+    const result = await sendInterviewConfirmationEmail({
+      toEmail: to,
+      userName: em.rows[0].name,
+      jobTitle: slot.job_title,
+      company: slot.company,
+      scheduledAt: new Date(slot.scheduled_at).toISOString(),
+      durationMinutes: slot.duration_minutes || 45,
+      mode: slot.mode || 'online',
+      meetingUrl: slot.meeting_url || undefined,
+      notes: slot.notes || undefined,
+      ics,
+    });
+    res.json({ success: result.success, resentTo: to, error: result.error });
+  } catch (error: any) {
+    console.error('resend-invite failed:', error.message);
+    res.status(500).json({ error: 'Failed to resend the invitation.' });
   }
 });
 
@@ -1961,12 +2055,20 @@ router.post('/interview-reminders/run', async (req: Request, res: Response) => {
 // ==========================================
 // 10. ANALYTICS & COPILOT
 // ==========================================
-router.get('/analytics', (req: Request, res: Response) => {
-  res.json({
-    collegeDepartmentStats: COLLEGE_DEPARTMENT_STATS,
-    govtRegionalStats: GOVT_REGIONAL_STATS,
-    emergingSkillTrends: EMERGING_SKILL_TRENDS,
-  });
+router.get('/analytics', async (req: Request, res: Response) => {
+  // Real aggregates from live tables — every figure on the analytics
+  // dashboards is computed from students/assessments/applications/jobs.
+  try {
+    const [collegeDepartmentStats, govtRegionalStats, emergingSkillTrends] = await Promise.all([
+      getCollegeDepartmentStats(),
+      getGovtRegionalStats(),
+      getEmergingSkillTrends(),
+    ]);
+    res.json({ collegeDepartmentStats, govtRegionalStats, emergingSkillTrends });
+  } catch (error: any) {
+    console.error('GET /analytics failed:', error.message);
+    res.status(500).json({ error: 'Failed to compute analytics.' });
+  }
 });
 
 router.post('/copilot', async (req: Request, res: Response) => {
@@ -1986,6 +2088,13 @@ router.post('/auth/register-send-otp', async (req: Request, res: Response) => {
   const { email, name } = req.body;
   if (!email || typeof email !== 'string' || !email.includes('@')) {
     return res.status(400).json({ error: 'Please provide a valid email address.' });
+  }
+
+  // Brute-force guard: per-IP + per-email sliding window.
+  const rlKey = `register-otp:${clientIpOf(req)}|${String(email).trim().toLowerCase()}`;
+  const rl = checkRateLimit(rlKey, 6);
+  if (!rl.allowed) {
+    return res.status(429).json({ error: `Too many OTP requests. Try again in ${Math.ceil((rl.retryAfterSeconds || 60) / 60)} minute(s).` });
   }
 
   const normalizedEmail = email.trim().toLowerCase();
@@ -2306,6 +2415,13 @@ router.post('/register', async (req: Request, res: Response) => {
 // 12. FORGOT PASSWORD & OTP DISPATCH
 // ==========================================
 router.post('/auth/forgot-password', async (req: Request, res: Response) => {
+  // Abuse guard: password-reset OTPs are rate limited per IP + email.
+  const rlKey = `forgot:${clientIpOf(req)}|${String(req.body?.email || '').trim().toLowerCase()}`;
+  const rl = checkRateLimit(rlKey, 6);
+  if (!rl.allowed) {
+    return res.status(429).json({ error: `Too many reset attempts. Try again in ${Math.ceil((rl.retryAfterSeconds || 60) / 60)} minute(s).` });
+  }
+
   const { email } = req.body;
   if (!email || typeof email !== 'string' || !email.includes('@')) {
     return res.status(400).json({ error: 'Please provide a valid email address.' });
@@ -2487,6 +2603,13 @@ router.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
+  }
+
+  // Brute-force guard: 10 attempts / 15 min per IP+email, then a 10 min lockout.
+  const rlKey = `login:${clientIpOf(req)}|${String(email).trim().toLowerCase()}`;
+  const rl = checkRateLimit(rlKey, 10);
+  if (!rl.allowed) {
+    return res.status(429).json({ error: `Too many login attempts. Try again in ${Math.ceil((rl.retryAfterSeconds || 60) / 60)} minute(s).` });
   }
 
   const normalizedEmail = email.trim().toLowerCase();

@@ -638,6 +638,56 @@ describe('Job ownership, lifecycle & pagination', () => {
   });
 });
 
+// ── ANALYTICS (REAL SQL AGGREGATES) ─────────────────────────────────────────
+describe('GET /api/analytics (live aggregates, no mock data)', () => {
+  dbIt('computes department/region/skill stats from the live tables', async () => {
+    const res = await request(app).get('/api/analytics');
+    expect(res.status).toBe(200);
+
+    const studentsTotal = await pool.query('SELECT count(*)::int AS n FROM students');
+    const sumDepts = res.body.collegeDepartmentStats.reduce((s: number, d: any) => s + d.totalStudents, 0);
+    expect(sumDepts).toBe(studentsTotal.rows[0].n);
+    expect(res.body.collegeDepartmentStats.length).toBeGreaterThan(0);
+    for (const d of res.body.collegeDepartmentStats) {
+      expect(d.department).toBeTruthy();
+      expect(typeof d.placementPercentage).toBe('number');
+      expect(d.topSkillGap).toBeTruthy();
+    }
+
+    const sumRegions = res.body.govtRegionalStats.reduce((s: number, r: any) => s + r.totalStudents, 0);
+    expect(sumRegions).toBe(studentsTotal.rows[0].n);
+    for (const r of res.body.govtRegionalStats) {
+      expect(r.tierDistribution.tier1 + r.tierDistribution.tier2 + r.tierDistribution.tier3).toBe(r.totalStudents);
+    }
+
+    expect(Array.isArray(res.body.emergingSkillTrends)).toBe(true);
+    for (const t of res.body.emergingSkillTrends) {
+      expect(typeof t.industryDemandGrowth).toBe('number');
+      expect(typeof t.academicSupplyCount).toBe('number');
+      expect(t.gapIndex).toBeGreaterThanOrEqual(0);
+      expect(t.gapIndex).toBeLessThanOrEqual(99);
+    }
+  });
+});
+
+// ── AUTH RATE LIMITING ──────────────────────────────────────────────────────
+describe('Auth rate limiting (brute-force guard)', () => {
+  dbIt('locks out an IP+email after repeated failed logins (429)', async () => {
+    const email = `e2e-ratelimit-${Date.now()}@spark.test`;
+    let saw429 = false;
+    for (let i = 0; i < 12; i++) {
+      const res = await request(app).post('/api/login').send({ email, password: 'WrongPassword!1' });
+      if (res.status === 429) {
+        saw429 = true;
+        expect(String(res.body.error)).toMatch(/too many login attempts/i);
+        break;
+      }
+      expect(res.status).toBe(401);
+    }
+    expect(saw429).toBe(true);
+  });
+});
+
 // ── JOB-ALERTS PREFERENCE TOGGLE ─────────────────────────────────────────────
 describe('Job-alerts preference (GET/PATCH /me/job-alerts)', () => {
   let token = '';
@@ -923,6 +973,13 @@ describe('Interview scheduling (POST /applications/schedule-interviews)', () => 
       expect(slot.applicationId).toBe(appId);
       expect(new Date(slot.scheduledAt).toISOString()).toBe(when);
 
+      // Add-to-Calendar: the slot's student can download the .ics invite
+      const ics = await request(app).get(`/api/interview-slots/${slot.id}/ics`).set('Authorization', `Bearer ${studentToken}`);
+      expect(ics.status).toBe(200);
+      expect(ics.headers['content-type']).toMatch(/text\/calendar/);
+      expect(ics.text).toContain('BEGIN:VCALENDAR');
+      expect(ics.text).toContain('SUMMARY:Interview — E2E Sched Role @ E2E Corp');
+      expect(ics.text).toContain('UID:');
       // A different student account sees none of them
       const otherStamp = Date.now() + 1;
       const otherEmail = `e2e-slotviewer-${otherStamp}@spark.test`;
@@ -935,6 +992,10 @@ describe('Interview scheduling (POST /applications/schedule-interviews)', () => 
         const otherLogin = await request(app).post('/api/login').send({ email: otherEmail, password: 'SlotView!2026' });
         const otherSlots = await request(app).get('/api/me/interview-slots').set('Authorization', `Bearer ${otherLogin.body.token}`);
         expect(otherSlots.body.slots.length).toBe(0);
+
+        // A stranger cannot download someone else's invite
+        const strangerIcs = await request(app).get(`/api/interview-slots/${slot.id}/ics`).set('Authorization', `Bearer ${otherLogin.body.token}`);
+        expect(strangerIcs.status).toBe(403);
       } finally {
         await pool.query(`DELETE FROM users WHERE id = $1`, [`usr-e2e-slotother-${otherStamp}`]).catch(() => {});
       }

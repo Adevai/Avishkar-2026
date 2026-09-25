@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { SAMPLE_STUDENTS } from '../../data/mockData';
+
 import { api } from '../../services/api';
 import { StudentProfile } from '../../types';
 import { 
@@ -15,7 +15,8 @@ import {
   Mail,
   ExternalLink,
   RefreshCw,
-  Radio
+  Radio,
+  AlertTriangle
 } from 'lucide-react';
 
 export const TalentSearch: React.FC = () => {
@@ -24,29 +25,34 @@ export const TalentSearch: React.FC = () => {
   const [roleFilter, setRoleFilter] = useState<string>('All');
   const [searchTerm, setSearchTerm] = useState<string>('');
 
-  // Live talent pool from PostgreSQL, with curated registry as offline fallback
-  const [talentPool, setTalentPool] = useState<StudentProfile[]>(SAMPLE_STUDENTS);
+  // Live talent pool from PostgreSQL — no fake fallback rows; the UI
+  // shows honest loading / error / empty states instead.
+  const [talentPool, setTalentPool] = useState<StudentProfile[]>([]);
   const [isLive, setIsLive] = useState<boolean>(false);
   const [isLoadingPool, setIsLoadingPool] = useState<boolean>(true);
+  const [poolError, setPoolError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadPool = () => {
+    setIsLoadingPool(true);
+    setPoolError(null);
     let cancelled = false;
     api.getStudents()
       .then(students => {
         if (cancelled) return;
-        if (students && students.length > 0) {
-          setTalentPool(students);
-          setIsLive(true);
-        }
+        setTalentPool(students || []);
+        setIsLive(true);
       })
-      .catch(() => {
-        // Keep the curated fallback pool silently
+      .catch((e: any) => {
+        if (cancelled) return;
+        setPoolError(e?.message || 'Failed to load the talent pool.');
       })
       .finally(() => {
         if (!cancelled) setIsLoadingPool(false);
       });
     return () => { cancelled = true; };
-  }, []);
+  };
+
+  useEffect(() => loadPool(), []);
 
   const filteredTalent = talentPool.filter(s => {
     if (s.readinessScore < minScore) return false;
@@ -82,7 +88,7 @@ export const TalentSearch: React.FC = () => {
                 : 'bg-slate-50 text-slate-500 border-slate-200'
             }`}>
               <Radio className={`w-3 h-3 ${isLive ? 'text-emerald-600' : 'text-slate-400'} ${isLive ? 'animate-pulse' : ''}`} />
-              <span>{isLoadingPool ? 'Syncing talent pool…' : isLive ? 'Live PostgreSQL pool' : 'Offline curated pool'}</span>
+              <span>{isLoadingPool ? 'Syncing talent pool…' : poolError ? 'Connection error' : isLive ? 'Live PostgreSQL pool' : 'No candidates yet'}</span>
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
@@ -144,6 +150,32 @@ export const TalentSearch: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Honest empty / error states — no fake candidate rows */}
+      {isLoadingPool ? (
+        <div className="bg-white rounded-2xl p-12 border border-slate-200/80 shadow-xs text-center">
+          <RefreshCw className="w-8 h-8 text-blue-500 animate-spin mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-700">Loading live talent pool…</p>
+        </div>
+      ) : poolError ? (
+        <div className="bg-white rounded-2xl p-12 border border-rose-200 shadow-xs text-center">
+          <AlertTriangle className="w-8 h-8 text-rose-500 mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-800">Could not load candidates</p>
+          <p className="text-xs text-slate-500 mt-1">{poolError}</p>
+          <button
+            onClick={loadPool}
+            className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs"
+          >
+            ↻ Retry
+          </button>
+        </div>
+      ) : filteredTalent.length === 0 ? (
+        <div className="bg-white rounded-2xl p-12 border border-slate-200/80 shadow-xs text-center">
+          <Search className="w-8 h-8 text-slate-300 mx-auto mb-3" />
+          <p className="text-xs font-bold text-slate-700">No candidates match your filters</p>
+          <p className="text-xs text-slate-400 mt-1">Try widening the readiness threshold or clearing the search.</p>
+        </div>
+      ) : null}
 
       {/* Candidate Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

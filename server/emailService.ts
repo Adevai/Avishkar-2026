@@ -3,23 +3,30 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// SMTP settings come from the environment. The embedded defaults preserve the
-// original demo behavior for local development — set EMAIL_USER / EMAIL_PASS
-// (Gmail App Password) explicitly in production.
+// SMTP settings are environment-only — no credential fallbacks in code.
+// In non-production, a missing/misconfigured SMTP keeps signup and email
+// flows alive via the DEV fallbacks in each sender (logged OTP / reminder).
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10) || 587;
-const EMAIL_USER = process.env.EMAIL_USER || 'refakshat1609@gmail.com';
-const EMAIL_PASS = (process.env.EMAIL_PASS || 'ugemlyhtnoiykjic').replace(/\s+/g, '');
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = (process.env.EMAIL_PASS || '').replace(/\s+/g, '');
+
+if (!EMAIL_USER || !EMAIL_PASS) {
+  const scope = process.env.NODE_ENV === 'production' ? 'PRODUCTION' : 'dev';
+  console.warn(
+    `[EmailService] EMAIL_USER/EMAIL_PASS not set — real email sending is disabled (${scope}).` +
+    (process.env.NODE_ENV !== 'production' ? ' DEV fallbacks will be used for OTPs and reminders.' : ' Configure SMTP before deploying!')
+  );
+}
 
 const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: SMTP_PORT,
   secure: false, // TLS
   requireTLS: true,
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS,
-  },
+  ...(EMAIL_USER && EMAIL_PASS
+    ? { auth: { user: EMAIL_USER, pass: EMAIL_PASS } }
+    : {}),
   tls: {
     rejectUnauthorized: false,
   },
