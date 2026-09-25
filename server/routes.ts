@@ -271,6 +271,58 @@ router.get('/institutions/external', async (req: Request, res: Response) => {
   }
 });
 
+// Public institution profile: AISHE code, verification status, and student
+// stats. The id is the institutions row id (stable, non-enumerable-ish),
+// safe to expose — no documents or emails leak here.
+router.get('/institutions/profile/:id', async (req: Request, res: Response) => {
+  try {
+    const inst = await query(
+      `SELECT i.id, i.aishe_code, i.official_domain, i.college_name, i.created_at,
+              u.id AS user_id, u.name AS tpo_name, u.verification_status
+         FROM institutions i JOIN users u ON u.id = i.user_id
+        WHERE i.id = $1
+        LIMIT 1`,
+      [req.params.id]
+    );
+    if (inst.rows.length === 0) {
+      return res.status(404).json({ error: 'Institution not found.' });
+    }
+    const row = inst.rows[0];
+    const instName = row.college_name || row.tpo_name;
+
+    // Live platform stats for this institution's account
+    const statsRes = await query(
+      `SELECT
+         (SELECT count(*)::int FROM jobs j WHERE j.posted_by = $1) AS campus_postings,
+         (SELECT count(*)::int FROM students s WHERE LOWER(s.college) = LOWER($2)) AS registered_students,
+         (SELECT count(*)::int FROM students s
+            JOIN users su ON su.id = s.user_id
+           WHERE LOWER(s.college) = LOWER($2) AND su.verification_status = 'verified') AS verified_students`,
+      [row.user_id, instName]
+    );
+    const stats = statsRes.rows[0] || { campus_postings: 0, registered_students: 0, verified_students: 0 };
+
+    res.json({
+      success: true,
+      institution: {
+        id: row.id,
+        userId: row.user_id,
+        name: instName,
+        tpoName: row.tpo_name,
+        aisheCode: row.aishe_code,
+        officialDomain: row.official_domain,
+        verificationStatus: row.verification_status || 'pending',
+        verified: row.verification_status === 'verified',
+        memberSince: row.created_at,
+      },
+      stats,
+    });
+  } catch (error: any) {
+    console.error('institution profile failed:', error.message);
+    res.status(500).json({ error: 'Failed to load the institution profile.' });
+  }
+});
+
 router.post('/verify/institution', async (req: Request, res: Response) => {
   const { name } = req.body || {};
   if (!name || typeof name !== 'string') {
@@ -1050,6 +1102,21 @@ router.patch('/roadmaps/:studentId/toggle-module', async (req: Request, res: Res
 // ==========================================
 // 5. JOBS & OPPORTUNITIES
 // ==========================================
+// Verified campus accounts: userId -> {institutionId, name, aisheCode}.
+// Used to stamp job cards with the public 'Verified Campus' badge.
+async function verifiedCampusMap(): Promise<Map<string, { institutionId: string; name: string; aisheCode: string | null }>> {
+  const r = await query(
+    `SELECT i.id AS institution_id, i.aishe_code, i.college_name, u.id AS user_id, u.name
+       FROM institutions i JOIN users u ON u.id = i.user_id
+      WHERE u.verification_status = 'verified' AND u.role = 'college'`
+  );
+  return new Map(r.rows.map((row: any) => [row.user_id, {
+    institutionId: row.institution_id,
+    name: row.college_name || row.name,
+    aisheCode: row.aishe_code || null,
+  }]));
+}
+
 function mapJobRow(r: any) {
   return {
     id: r.id,
@@ -1137,8 +1204,28 @@ router.get('/jobs', async (req: Request, res: Response) => {
       params
     );
 
+    const jobs = dataRes.rows.map(mapJobRow);
+
+    // Stamp postings from verified institution accounts with the public
+    // campus badge (one shared lookup, not a per-row join).
+    if (jobs.length > 0) {
+      try {
+        const campus = await verifiedCampusMap();
+        if (campus.size > 0) {
+          for (const j of jobs) {
+            const inst = j.postedBy ? campus.get(j.postedBy) : undefined;
+            if (inst) {
+              (j as any).campusInstitution = { id: inst.institutionId, name: inst.name, aisheCode: inst.aisheCode };
+            }
+          }
+        }
+      } catch (campusErr: any) {
+        console.warn('campus badge lookup skipped:', campusErr.message);
+      }
+    }
+
     res.json({
-      jobs: dataRes.rows.map(mapJobRow),
+      jobs,
       page,
       limit,
       total,
@@ -3148,11 +3235,12 @@ router.post('/register', async (req: Request, res: Response) => {
         const instId = `inst-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
         const affiliationDoc = req.body.affiliationDocument ? String(req.body.affiliationDocument).slice(0, 500) : null;
         await client.query(
-          `INSERT INTO institutions (id, user_id, aishe_code, official_domain, affiliation_document_url)
-           VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO institutions (id, user_id, aishe_code, official_domain, college_name, affiliation_document_url)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
           [instId, effectiveUserId,
            String(req.body.aisheCode || '').trim().toUpperCase(),
            String(req.body.officialDomain || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, ''),
+           college || null,
            affiliationDoc]
         );
       }

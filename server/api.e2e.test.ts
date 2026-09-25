@@ -629,6 +629,35 @@ describe('Portal role verification matrix', () => {
     await pool.query(`DELETE FROM users WHERE id = $1`, [acct.id]).catch(() => {});
   });
 
+  dbIt('institution profile: public AISHE info, verified badge, stats; campus badge stamps own jobs', async () => {
+    // collegeEmail was registered & verified earlier in this describe
+    const instId = await pool.query(`SELECT id FROM institutions WHERE user_id = (SELECT id FROM users WHERE LOWER(email) = $1)`, [collegeEmail]);
+    expect(instId.rows[0]?.id).toBeTruthy();
+
+    const profile = await request(app).get(`/api/institutions/profile/${instId.rows[0].id}`);
+    expect(profile.status).toBe(200);
+    expect(profile.body.institution.verified).toBe(true);
+    expect(profile.body.institution.aisheCode).toBe('C-33915');
+    expect(profile.body.institution.officialDomain).toBe('spark-inst.test');
+    expect(profile.body.stats).toHaveProperty('campus_postings');
+
+    const missing = await request(app).get('/api/institutions/profile/inst-does-not-exist');
+    expect(missing.status).toBe(404);
+
+    // A job posted by the verified college account carries the campus badge.
+    // Login as the college TPO and post, then check the public board.
+    const colLogin = await request(app).post('/api/login').send({ email: collegeEmail, password: 'Col@2026' });
+    const posted = await request(app).post('/api/jobs')
+      .set('Authorization', `Bearer ${colLogin.body.token}`)
+      .send({ title: 'E2E Campus Role', company: 'E2E Institute Placements', location: 'Pune', type: 'Internship', stipendOrSalary: '₹25,000 / month', description: 'Campus posting' });
+    expect(posted.status).toBe(200);
+    const board = await request(app).get('/api/jobs?q=E2E Campus Role');
+    const hit = board.body.jobs.find((j: any) => j.id === posted.body.job.id);
+    expect(hit?.campusInstitution?.id).toBe(instId.rows[0].id);
+    expect(hit?.campusInstitution?.aisheCode).toBe('C-33915');
+    await pool.query(`DELETE FROM jobs WHERE id = $1`, [posted.body.job.id]);
+  });
+
   dbIt('alumni registers with grad year + enrollment + LinkedIn, stays pending until the college vouches, then the mentor profile unlocks', async () => {
     // Missing LinkedIn → 400
     const noLinkedin = await registerViaOtp({

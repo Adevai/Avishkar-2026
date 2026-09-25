@@ -14,6 +14,7 @@ const Register = lazy(() => import('./pages/Register').then(m => ({ default: m.R
 const Onboarding = lazy(() => import('./pages/Onboarding').then(m => ({ default: m.Onboarding })));
 const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })));
 const DatabaseAdmin = lazy(() => import('./pages/DatabaseAdmin').then(m => ({ default: m.DatabaseAdmin })));
+const InstitutionProfile = lazy(() => import('./pages/InstitutionProfile').then(m => ({ default: m.InstitutionProfile })));
 
 /** Minimal full-screen fallback while a chunk downloads. */
 const RouteFallback: React.FC = () => (
@@ -41,6 +42,9 @@ export function App() {
 
             {/* Main Dashboard */}
             <Route path="/dashboard/*" element={<Dashboard />} />
+
+            {/* Public institution profile (linked from Verified Campus badges) */}
+            <Route path="/institutions/:id" element={<InstitutionProfile />} />
 
             {/* Web Database Administration GUI (Like Django Admin) */}
             <Route path="/admin" element={<DatabaseAdmin />} />

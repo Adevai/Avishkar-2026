@@ -256,6 +256,8 @@ export interface JobOpportunity {
   /** Recruiter ownership (null for externally-synced listings) */
   postedBy?: string;
   postedByName?: string;
+  /** Present when the posting comes from an AISHE-verified institution account */
+  campusInstitution?: { id: string; name: string; aisheCode: string | null };
   /** Lifecycle state — public board only shows 'open' */
   status?: 'open' | 'closed' | 'filled';
   workplaceType?: 'On-site' | 'Hybrid' | 'Remote';

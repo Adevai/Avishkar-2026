@@ -623,9 +623,11 @@ export async function initDatabase() {
           user_id VARCHAR(64) REFERENCES users(id) ON DELETE CASCADE,
           aishe_code VARCHAR(32),
           official_domain VARCHAR(255),
+          college_name VARCHAR(255),
           affiliation_document_url TEXT,
           created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+      ALTER TABLE institutions ADD COLUMN IF NOT EXISTS college_name VARCHAR(255);
 
       CREATE TABLE IF NOT EXISTS industries (
           id VARCHAR(64) PRIMARY KEY,

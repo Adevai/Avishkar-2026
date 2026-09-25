@@ -32,8 +32,10 @@ import {
   Check,
   Send,
   UploadCloud,
-  Eye
+  Eye,
+  BadgeCheck
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { JobOpportunity } from '../../types';
 import { api } from '../../services/api';
 import { getDeadlineInfo } from '../../utils/deadlineUtils';
@@ -459,6 +461,15 @@ export const JobMatches: React.FC = () => {
                     <div>
                       <div className="flex items-center gap-2">
                         <h2 className="text-sm font-bold text-slate-900 leading-snug">{job.title}</h2>
+                        {job.campusInstitution && (
+                          <Link
+                            to={`/institutions/${job.campusInstitution.id}`}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-50 text-emerald-700 border border-emerald-300 hover:bg-emerald-100 transition-colors shrink-0"
+                            title={`AISHE-verified institution: ${job.campusInstitution.name}`}
+                          >
+                            <BadgeCheck className="w-3 h-3" /> Verified Campus
+                          </Link>
+                        )}
                       </div>
                       <p className="text-xs font-semibold text-slate-600 flex items-center gap-1.5 mt-0.5">
                         <Building className="w-3.5 h-3.5 text-slate-400" />
