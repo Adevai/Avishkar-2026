@@ -892,6 +892,60 @@ describe('Portal role verification matrix', () => {
       await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [upEmail]).catch(() => {});
     }
   });
+
+  dbIt('admin-stats: queue volume, median decision time, rejection reasons, role gating', async () => {
+    const statEmail = `e2e-stats-${stamp}@stat.test`;
+    const reg = await registerViaOtp({
+      role: 'industry', name: 'E2E Stats Corp', email: statEmail, password: 'St@2026',
+      company: 'Stats Corp', incorporationDocument: '/uploads/verify/stats-cert.pdf',
+    });
+    expect(reg).toBe(200);
+    const uRow = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [statEmail]);
+    const userId = uRow.rows[0].id;
+
+    try {
+      // Live queue volume counts the pending account.
+      const before = await request(app).get('/api/verify/admin-stats').set('Authorization', `Bearer ${adminToken}`);
+      expect(before.status).toBe(200);
+      expect(before.body.success).toBe(true);
+      expect(before.body.queueVolume).toBeGreaterThanOrEqual(1);
+
+      // Non-admins are bounced.
+      const stuLogin = await request(app).post('/api/login').send({ email: acStudentEmail, password: 'AcStu@2026' });
+      const forbidden = await request(app).get('/api/verify/admin-stats').set('Authorization', `Bearer ${stuLogin.body.token}`);
+      expect(forbidden.status).toBe(403);
+      const anon = await request(app).get('/api/verify/admin-stats');
+      expect(anon.status).toBe(401);
+
+      // A rejection with a note feeds the rejection-reasons tally and the
+      // median decision clock.
+      const reject = await request(app)
+        .patch(`/api/verify/admin-queue/${userId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ decision: 'rejected', reviewNote: 'Stats test rejection' });
+      expect(reject.status).toBe(200);
+
+      const after = await request(app).get('/api/verify/admin-stats').set('Authorization', `Bearer ${adminToken}`);
+      expect(after.status).toBe(200);
+      expect(after.body.decisionsCounted).toBeGreaterThanOrEqual(1);
+      expect(after.body.medianDecisionHours).toBeGreaterThanOrEqual(0);
+      const reason = after.body.rejectionReasons.find((r: any) => r.reason === 'Stats test rejection');
+      expect(reason).toBeTruthy();
+      expect(reason.count).toBeGreaterThanOrEqual(1);
+
+      // groupByRole splits the volume by account kind.
+      const grouped = await request(app).get('/api/verify/admin-stats?groupByRole=1').set('Authorization', `Bearer ${adminToken}`);
+      expect(grouped.status).toBe(200);
+      expect(Array.isArray(grouped.body.queueVolume)).toBe(true);
+    } finally {
+      // Remove this fixture's audit trail so aggregate stats stay clean.
+      await pool.query(`DELETE FROM audit_logs WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'targetUserId' = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM industries WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [statEmail]).catch(() => {});
+    }
+  });
 });
 
 // ── JOB OWNERSHIP + LIFECYCLE + PAGINATION ───────────────────────────────────

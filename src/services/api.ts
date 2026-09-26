@@ -459,6 +459,18 @@ export const api = {
     return await res.json();
   },
 
+  async getAdminStats(groupByRole = false): Promise<{
+    success: boolean;
+    queueVolume: number | { role: string; count: number }[];
+    medianDecisionHours: number | null;
+    decisionsCounted: number;
+    rejectionReasons: { reason: string; count: number }[];
+  }> {
+    const res = await authFetch(`${API_BASE}/verify/admin-stats${groupByRole ? '?groupByRole=1' : ''}`);
+    if (!res.ok) throw new Error('Failed to load admin verification stats');
+    return await res.json();
+  },
+
   async getVerificationDocumentUrl(userId: string): Promise<{ success: boolean; url: string; expiresInMinutes: number }> {
     const res = await authFetch(`${API_BASE}/verify/admin-queue/${encodeURIComponent(userId)}/document-url`);
     const data = await res.json().catch(() => ({}));

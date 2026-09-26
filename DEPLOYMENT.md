@@ -121,3 +121,79 @@ Set up a nightly cron on the host:
 - [ ] Rate limits reviewed (`RATE_LIMIT_MAX` in `server/index.ts` is 20/15 min on auth)
 - [ ] `NODE_ENV=production` (enables HSTS + CSP headers)
 - [ ] Log rotation: `docker compose logs` grows unbounded — install `logrotate` or use `--log-driver=json-file --log-opt max-size=10m`
+
+## 9. Durable file storage (resumes + verification certificates)
+
+Student resumes and institution/industry verification certificates are stored
+on disk and served **only** through expiring HMAC-signed URLs (10 minutes,
+same pattern for both). Raw paths are never exposed: the admin queue returns a
+`hasDocument` flag and clients mint a fresh signed link per view. There is no
+public `/uploads/*` static route - probing it just hits the SPA fallback.
+
+Because the files live on the **container filesystem by default**, a redeploy
+without a volume would lose every resume and certificate. Fix that before
+go-live with the `UPLOADS_DIR` env var.
+
+### How it works
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `UPLOADS_DIR` | `<cwd>/uploads` | Root for all user uploads; files land in `resumes/` and `verify/` subdirectories |
+| `JWT_SECRET` | dev fallback | **Must be stable across restarts/replicas** - signed-URL HMACs are derived from it; rotating it instantly invalidates every outstanding link |
+
+### docker compose (default in this repo)
+
+`docker-compose.yml` already mounts a named volume and exports `UPLOADS_DIR`:
+
+```yaml
+app:
+  environment:
+    UPLOADS_DIR: /data/uploads      # override in .env to bind-mount a host dir
+  volumes:
+    - uploads_data:/data/uploads    # survives `docker compose up -d --build`
+```
+
+To pin the data to a specific host path instead (simpler to back up with
+rsync/restic), set in `.env`:
+
+```bash
+UPLOADS_DIR=/var/lib/spark/uploads   # host dir, bind-mounted into the container
+```
+
+### Kubernetes / ECS / any container platform
+
+Mount a persistent volume (PVC, EFS, EBS) at `/data/uploads` (or any path) and
+set `UPLOADS_DIR` to that path. Files are written once at upload time and only
+read via signed links, so a shared filesystem across replicas works fine - no
+sticky sessions needed.
+
+### Object storage (S3-compatible)
+
+The app intentionally keeps writes local-disk so it runs without cloud
+credentials. For bucket-backed durability, mount the bucket on the host (e.g.
+`rclone mount s3:spark-uploads /var/lib/spark/uploads` or an NFS/S3 gateway)
+and point `UPLOADS_DIR` at the mount. The HMAC signature scheme is independent
+of where bytes live - moving the directory does **not** invalidate existing
+links, and no pre-signed URL plumbing is required.
+
+### Migration from an existing install
+
+Files uploaded before `UPLOADS_DIR` existed live in `<repo>/uploads/`. Copy
+them into the volume once and restart:
+
+```bash
+docker compose cp app:/app/uploads/. /var/lib/spark/uploads/   # or rsync from the old host
+docker compose up -d
+```
+
+Legacy relative paths already stored in the database are resolved against the
+app's working directory at serve time; new uploads always record absolute
+paths under `UPLOADS_DIR`.
+
+### Operational checklist
+
+- [ ] `UPLOADS_DIR` set to a volume, not the container layer
+- [ ] `JWT_SECRET` identical across restarts and replicas (secret manager)
+- [ ] Include the uploads volume in the same backup cron as Postgres
+- [ ] After any restore, spot-check one signed link end-to-end (queue -> Certificate button)
+- [ ] Disk usage watch: 15 MB per-file cap (multer limit); alert at 80%

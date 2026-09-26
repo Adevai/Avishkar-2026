@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import jwt from 'jsonwebtoken';
 import { PDFParse } from 'pdf-parse';
 import { query, pool } from './db';
 import { ASSESSMENT_QUESTIONS, COLLEGE_DEPARTMENT_STATS, GOVT_REGIONAL_STATS, EMERGING_SKILL_TRENDS } from '../src/data/mockData';
@@ -26,6 +26,15 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
 });
+
+// Durable storage root for user uploads (resumes + verification
+// certificates). Point UPLOADS_DIR at a mounted volume (or a bind mount of
+// an object-store bucket) so files survive container replacement — see the
+// "Durable file storage" section of DEPLOYMENT.md. Legacy relative paths
+// stored in the DB are still resolved against process.cwd() when serving.
+const UPLOADS_ROOT = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(process.cwd(), 'uploads');
 
 export const router = Router();
 
@@ -225,7 +234,24 @@ router.get('/events', (req: Request, res: Response) => {
   });
   res.write(`event: connected\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
 
-  const clientId = addClient(res, (req.query.userId as string) || null);
+  // Resolve the portal role from the bearer token (if any) so role-targeted
+  // events — e.g. verification-queue alerts for college/government desks —
+  // reach the right dashboards. Anonymous connections stay broadcast-only.
+  // EventSource cannot set headers, so the browser also passes ?token=.
+  let sseRole: string | null = null;
+  const authHeader = req.headers.authorization;
+  const rawToken = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.query.token as string) || '';
+  if (rawToken) {
+    try {
+      const decoded: any = jwt.verify(rawToken, process.env.JWT_SECRET || 'spark-dev-secret');
+      sseRole = decoded.role || null;
+    } catch {
+      // Invalid/expired token — connect as anonymous rather than failing the stream.
+    }
+  }
+  const clientId = addClient(res, (req.query.userId as string) || null, sseRole);
   req.on('close', () => removeClient(clientId));
 });
 
@@ -674,7 +700,7 @@ router.post('/students/:id/upload-resume', upload.single('resume'), async (req: 
 
     // Persist the original file to local disk (uploads/resumes) so it
     // survives restarts and can be served via an expiring signed URL.
-    const resumeDir = path.resolve(process.cwd(), 'uploads', 'resumes');
+    const resumeDir = path.join(UPLOADS_ROOT, 'resumes');
     await fs.promises.mkdir(resumeDir, { recursive: true });
     const safeName = `${req.params.id}-${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const resumePath = path.join(resumeDir, safeName);
@@ -2231,7 +2257,11 @@ router.get('/students/:id/resume', async (req: Request, res: Response) => {
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${(r.rows[0].resume_name || 'resume').replace(/["\r\n]/g, '')}"`);
-    res.sendFile(r.rows[0].resume_path);
+    // Tolerate legacy relative URLs from earlier uploads (matches the
+    // verification-certificate route so both survive a cwd change).
+    const storedPath: string = r.rows[0].resume_path;
+    const absResumePath = path.isAbsolute(storedPath) ? storedPath : path.join(process.cwd(), storedPath);
+    res.sendFile(absResumePath);
   } catch (error: any) {
     console.error('resume download failed:', error.message);
     res.status(500).json({ error: 'Failed to serve the resume.' });
@@ -3271,6 +3301,22 @@ router.post('/register', async (req: Request, res: Response) => {
 
       await client.query('COMMIT');
 
+      // New pending accounts must light up TPO/admin desks instantly (SSE),
+      // not wait for the next poll. Rejected accounts re-enter the admin queue.
+      if (verificationStatus === 'pending_college_approval') {
+        emitEvent({
+          type: 'verification_queue', title: 'New approval pending',
+          message: `${name.trim()} (${role === 'alumni' ? 'alumnus' : 'student'}) is awaiting college approval.`,
+          targetRole: 'college', data: { role },
+        });
+      } else if (verificationStatus === 'pending_admin_approval') {
+        emitEvent({
+          type: 'verification_queue', title: 'New certificate to review',
+          message: `${name.trim()} registered with a document — waiting in the admin verification queue.`,
+          targetRole: 'government', data: { role },
+        });
+      }
+
       if (isExistingAccount) {
         // Notify the previous account holder — non-blocking for the response.
         sendSecurityAlertEmail({
@@ -3373,7 +3419,7 @@ router.post('/verify/affiliation-document', requireAuth, upload.single('document
     }
     // Same persistence pattern as resumes: absolute path on disk under
     // uploads/verify, served ONLY through expiring signed URLs.
-    const docDir = path.resolve(process.cwd(), 'uploads', 'verify');
+    const docDir = path.join(UPLOADS_ROOT, 'verify');
     await fs.promises.mkdir(docDir, { recursive: true });
     const safeName = `${user.sub}-${Date.now()}-${req.file.originalname.replace(/[^A-Za-z0-9._-]/g, '_').slice(-80)}`;
     const docPath = path.join(docDir, safeName);
@@ -3386,6 +3432,13 @@ router.post('/verify/affiliation-document', requireAuth, upload.single('document
     }
     // Document submitted → (re)enter the admin approval queue.
     await query(`UPDATE users SET verification_status = 'pending_admin_approval' WHERE id = $1 AND verification_status <> 'verified'`, [user.sub]);
+    // Certificate (re)submitted → ping the admin desk over SSE so it lands
+    // in the queue view without waiting for a refresh/poll.
+    emitEvent({
+      type: 'verification_queue', title: 'Certificate submitted for review',
+      message: `${role === 'college' ? 'Institution' : 'Company'} account uploaded a verification certificate.`,
+      targetRole: 'government', data: { userId: user.sub, role },
+    });
     await query(
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
       [user.sub, role === 'college' ? 'AFFILIATION_DOC_UPLOADED' : 'INCORPORATION_DOC_UPLOADED', JSON.stringify({ file: safeName, size: req.file.size })]
@@ -3509,7 +3562,100 @@ router.patch('/verify/admin-queue/:userId', requireAdmin, async (req: Request, r
         : `Your verification was not approved.${reviewNote ? ` Note: ${reviewNote}` : ''} You can re-upload documents and resubmit.`,
       decision === 'verified' ? 'success' : 'alert'
     );
+    // Rejected accounts head back to this desk for a fresh review.
+    if (decision === 'rejected') {
+      emitEvent({
+        type: 'verification_queue', title: 'Queue updated',
+        message: `${acct.name} was rejected and can resubmit documents.`,
+        targetRole: 'government', data: { userId: acct.id, decision },
+      });
+    }
     res.json({ success: true, status: decision });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Platform Admin desk metrics: queue volume, median decision time and
+// rejection reasons — feeds the metrics strip above the admin queue.
+router.get('/verify/admin-stats', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    // Queue volume: accounts currently waiting on a document review, split by
+    // account kind (or one bucket when `groupByRole` is not requested).
+    const byRole = String(req.query.groupByRole || '') === '1';
+    const queueVol = await query(
+      byRole
+        ? `SELECT u.role, count(*)::int AS n FROM users u WHERE u.verification_status = 'pending_admin_approval' GROUP BY u.role`
+        : `SELECT count(*)::int AS n FROM users u WHERE u.verification_status = 'pending_admin_approval'`
+    );
+
+    // Median decision time: newest COLLEGE/ADMIN VERIFICATION_DECISION audit
+    // row per account, paired with the account's creation time. Audit details
+    // are written by the admin desk at decision time.
+    const decisions = await query(
+      `SELECT a.details ->> 'targetUserId' AS target_user_id, a.created_at
+         FROM audit_logs a
+        WHERE a.action = 'ADMIN_VERIFICATION_DECISION'
+        ORDER BY a.created_at ASC`
+    );
+    const firstDecision = new Map<string, Date>();
+    for (const row of decisions.rows) {
+      if (row.target_user_id && !firstDecision.has(row.target_user_id)) {
+        firstDecision.set(row.target_user_id, new Date(row.created_at));
+      }
+    }
+    if (firstDecision.size > 0) {
+      const created = await query(
+        `SELECT id, created_at FROM users WHERE id = ANY($1)`,
+        [Array.from(firstDecision.keys())]
+      );
+      const durations: number[] = [];
+      for (const row of created.rows) {
+        const decidedAt = firstDecision.get(row.id);
+        if (decidedAt) {
+          const hours = (decidedAt.getTime() - new Date(row.created_at).getTime()) / 3_600_000;
+          if (hours >= 0 && hours < 24 * 365) durations.push(hours);
+        }
+      }
+      durations.sort((a, b) => a - b);
+      const mid = Math.floor(durations.length / 2);
+      const medianHours = durations.length === 0
+        ? null
+        : durations.length % 2 === 1
+          ? durations[mid]
+          : (durations[mid - 1] + durations[mid]) / 2;
+
+      // Rejection reasons from the decision notes (top 5, most frequent first).
+      const rejects = await query(
+        `SELECT details ->> 'note' AS reason, count(*)::int AS n
+           FROM audit_logs
+          WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'decision' = 'rejected'
+          GROUP BY 1 ORDER BY n DESC, 1 ASC LIMIT 5`
+      );
+
+      return res.json({
+        success: true,
+        queueVolume: byRole
+          ? queueVol.rows.map((r: any) => ({ role: r.role, count: r.n }))
+          : (queueVol.rows[0]?.n || 0),
+        medianDecisionHours: medianHours === null ? null : Math.round(medianHours * 10) / 10,
+        decisionsCounted: durations.length,
+        rejectionReasons: rejects.rows
+          .filter((r: any) => r.reason)
+          .map((r: any) => ({ reason: r.reason, count: r.n })),
+      });
+    }
+
+    // No decisions recorded yet — still report the live queue volume.
+    return res.json({
+      success: true,
+      queueVolume: byRole
+        ? queueVol.rows.map((r: any) => ({ role: r.role, count: r.n }))
+        : (queueVol.rows[0]?.n || 0),
+      medianDecisionHours: null,
+      decisionsCounted: 0,
+      rejectionReasons: [],
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -3600,6 +3746,12 @@ router.patch('/verify/college-approvals/:userId', requireAuth, async (req: Reque
           : `Your college declined your verification.${reviewNote ? ` Note: ${reviewNote}` : ''}`,
         decision === 'verified' ? 'success' : 'alert'
       );
+      // Keep every connected TPO desk in sync with the live badge count.
+      emitEvent({
+        type: 'verification_queue', title: 'Queue updated',
+        message: `${stu.name} was ${decision === 'verified' ? 'approved' : 'declined'} by the college desk.`,
+        targetRole: 'college', data: { userId: stu.id, decision },
+      });
       return res.json({ success: true, status: decision });
     }
 
@@ -3617,6 +3769,11 @@ router.patch('/verify/college-approvals/:userId', requireAuth, async (req: Reque
         `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'COLLEGE_ALUMNI_REJECTED', $2)`,
         [me.rows[0].email || me.rows[0].id, JSON.stringify({ applicationId: app.id })]
       ).catch(() => {});
+      emitEvent({
+        type: 'verification_queue', title: 'Queue updated',
+        message: `Alumni application from ${app.full_name} was declined.`,
+        targetRole: 'college', data: { applicationId: app.id, decision: 'rejected' },
+      });
       return res.json({ success: true, status: 'rejected' });
     }
 
@@ -3647,6 +3804,11 @@ router.patch('/verify/college-approvals/:userId', requireAuth, async (req: Reque
       'Your college TPO approved your alumni record — the Mentor Profile toggle is now unlocked in your dashboard.',
       'success'
     );
+    emitEvent({
+      type: 'verification_queue', title: 'Queue updated',
+      message: `Alumni application from ${app.full_name} was approved — mentor record minted.`,
+      targetRole: 'college', data: { applicationId: app.id, decision: 'approved', alumniId },
+    });
     res.json({ success: true, status: 'approved', alumniId });
   } catch (error: any) {
     console.error('college approval failed:', error.message);

@@ -16,6 +16,7 @@ export type SparkEventType =
   | 'new_mou'
   | 'new_problem'
   | 'assessment_result'
+  | 'verification_queue'
   | 'notification'
   | 'heartbeat';
 
@@ -24,6 +25,7 @@ export interface SparkEvent {
   title: string;
   message: string;
   targetUserId?: string | null;   // null/undefined = broadcast to all connected clients
+  targetRole?: string | null;     // deliver to every connected client with this portal role (college/government/...)
   data?: Record<string, any>;
   at: string;
 }
@@ -31,6 +33,7 @@ export interface SparkEvent {
 interface Client {
   id: string;
   userId: string | null;
+  role: string | null;
   res: Response;
 }
 
@@ -39,9 +42,9 @@ const clients = new Map<string, Client>();
 let clientSeq = 0;
 
 /** Register a browser connection (called by GET /api/events). */
-export function addClient(res: Response, userId: string | null): string {
+export function addClient(res: Response, userId: string | null, role: string | null = null): string {
   const id = `sse-${++clientSeq}-${Date.now().toString(36)}`;
-  clients.set(id, { id, userId, res });
+  clients.set(id, { id, userId, role, res });
   return id;
 }
 
@@ -65,8 +68,10 @@ export function emitEvent(evt: Omit<SparkEvent, 'at'>) {
 
   let delivered = 0;
   for (const [id, client] of clients) {
-    // Targeted events go only to that user; broadcast events go to everyone
+    // Targeted events go only to that user; role-targeted events go to every
+    // connection carrying that portal role; broadcasts go to everyone.
     if (payload.targetUserId && client.userId && payload.targetUserId !== client.userId) continue;
+    if (!payload.targetUserId && payload.targetRole && client.role !== payload.targetRole) continue;
 
     try {
       client.res.write(frame);

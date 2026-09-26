@@ -53,6 +53,10 @@ services:
       AUTO_SYNC_CRON: ${AUTO_SYNC_CRON:-false}
       SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-180}
       SEED_LARGE_DATASET: ${SEED_LARGE_DATASET:-true}
+      # ── Durable uploads (resumes + verification certificates) ──
+      UPLOADS_DIR: ${UPLOADS_DIR:-/data/uploads}
+    volumes:
+      - uploads_data:/data/uploads
     ports:
       - "5000:5000"
 
@@ -75,5 +79,6 @@ services:
 
 volumes:
   pgdata:
+  uploads_data:
   caddy_data:
   caddy_config:

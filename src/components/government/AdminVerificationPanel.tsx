@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   Building2, Factory, BadgeCheck, XCircle, Loader2, FileText,
-  ExternalLink, Inbox, RefreshCw, ShieldAlert,
+  ExternalLink, Inbox, RefreshCw, ShieldAlert, Clock, AlertOctagon, Layers,
 } from 'lucide-react';
 import { api } from '../../services/api';
 import { useApp } from '../../context/AppContext';
+import { SPARK_QUEUE_EVENT } from '../../hooks/useSparkEvents';
 
 interface AdminQueueAccount {
   id: string;
@@ -19,6 +20,71 @@ interface AdminQueueAccount {
   hasDocument: boolean;
 }
 
+interface AdminStats {
+  queueVolume: number | { role: string; count: number }[];
+  medianDecisionHours: number | null;
+  decisionsCounted: number;
+  rejectionReasons: { reason: string; count: number }[];
+}
+
+const totalOf = (v: AdminStats['queueVolume']) =>
+  typeof v === 'number' ? v : v.reduce((sum, r) => sum + r.count, 0);
+
+/**
+ * Metrics strip above the queue: live volume, median time-to-decision and
+ * the most common rejection reasons (from admin review notes).
+ */
+const MetricsStrip: React.FC<{ stats: AdminStats | null }> = ({ stats }) => {
+  if (!stats) return null;
+  const volume = totalOf(stats.queueVolume);
+  const median = stats.medianDecisionHours;
+  const medianLabel = median === null
+    ? '--'
+    : median < 48
+      ? `${Math.round(median)}h`
+      : `${Math.round((median / 24) * 10) / 10} days`;
+  const topReason = stats.rejectionReasons[0];
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div className="p-4 rounded-2xl bg-blue-50 border border-blue-200">
+        <div className="flex items-center gap-2 text-blue-700">
+          <Layers className="w-4 h-4" />
+          <span className="text-[10px] font-extrabold uppercase tracking-wider">Queue volume</span>
+        </div>
+        <p className="mt-1 text-2xl font-black text-blue-900">{volume}</p>
+        <p className="text-[10px] text-blue-600">accounts awaiting document review</p>
+      </div>
+      <div className="p-4 rounded-2xl bg-violet-50 border border-violet-200">
+        <div className="flex items-center gap-2 text-violet-700">
+          <Clock className="w-4 h-4" />
+          <span className="text-[10px] font-extrabold uppercase tracking-wider">Median decision time</span>
+        </div>
+        <p className="mt-1 text-2xl font-black text-violet-900">{medianLabel}</p>
+        <p className="text-[10px] text-violet-600">
+          across {stats.decisionsCounted} recorded decision{stats.decisionsCounted === 1 ? '' : 's'}
+        </p>
+      </div>
+      <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200">
+        <div className="flex items-center gap-2 text-rose-700">
+          <AlertOctagon className="w-4 h-4" />
+          <span className="text-[10px] font-extrabold uppercase tracking-wider">Top rejection reason</span>
+        </div>
+        <p className="mt-1 text-sm font-bold text-rose-900 leading-snug">
+          {topReason ? `"${topReason.reason}"` : 'No rejections recorded'}
+        </p>
+        {topReason && (
+          <p className="text-[10px] text-rose-600">
+            {topReason.count} time{topReason.count === 1 ? '' : 's'}
+            {stats.rejectionReasons.length > 1
+              ? ` + ${stats.rejectionReasons.length - 1} other reason${stats.rejectionReasons.length > 2 ? 's' : ''}`
+              : ' (from review notes)'}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+};
+
 /**
  * Platform Admin verification desk (Government role): institution and
  * industry accounts that registered with a Udyam/Incorporation or AICTE
@@ -28,6 +94,7 @@ interface AdminQueueAccount {
 export const AdminVerificationPanel: React.FC = () => {
   const { setNotification } = useApp();
   const [accounts, setAccounts] = useState<AdminQueueAccount[]>([]);
+  const [stats, setStats] = useState<AdminStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [docBusyId, setDocBusyId] = useState<string | null>(null);
@@ -36,8 +103,12 @@ export const AdminVerificationPanel: React.FC = () => {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await api.getAdminVerificationQueue();
-      setAccounts(res.accounts || []);
+      const [queue, s] = await Promise.all([
+        api.getAdminVerificationQueue(),
+        api.getAdminStats().catch(() => null),
+      ]);
+      setAccounts(queue.accounts || []);
+      setStats(s);
       setError(null);
     } catch (err: any) {
       setError(err.message || 'Failed to load the verification queue.');
@@ -47,6 +118,14 @@ export const AdminVerificationPanel: React.FC = () => {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // Live updates: SSE verification-queue pushes (new certificate, decision
+  // elsewhere) refresh the queue and metrics without a manual reload.
+  useEffect(() => {
+    const onQueue = () => load();
+    window.addEventListener(SPARK_QUEUE_EVENT, onQueue);
+    return () => window.removeEventListener(SPARK_QUEUE_EVENT, onQueue);
+  }, [load]);
 
   const decide = async (acct: AdminQueueAccount, decision: 'verified' | 'rejected') => {
     setBusyId(acct.id);
@@ -89,14 +168,18 @@ export const AdminVerificationPanel: React.FC = () => {
 
   if (accounts.length === 0) {
     return (
-      <div className="flex items-center gap-2 text-sm text-emerald-700 bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4">
-        <Inbox className="w-4 h-4" /> No accounts awaiting document verification.
+      <div className="space-y-3">
+        <MetricsStrip stats={stats} />
+        <div className="flex items-center gap-2 text-sm text-emerald-700 bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4">
+          <Inbox className="w-4 h-4" /> No accounts awaiting document verification.
+        </div>
       </div>
     );
   }
 
   return (
     <div className="space-y-3">
+      <MetricsStrip stats={stats} />
       <div className="flex items-center justify-between">
         <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">
           Accounts awaiting review ({accounts.length})

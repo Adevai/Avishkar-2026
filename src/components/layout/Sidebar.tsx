@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { api } from '../../services/api';
+import { SPARK_QUEUE_EVENT } from '../../hooks/useSparkEvents';
 import {
   UserCheck,
   BrainCircuit,
@@ -41,8 +42,12 @@ export const Sidebar: React.FC = () => {
       .then(r => { if (!cancelled) setPendingApprovals((r.students || 0) + (r.alumni || 0)); })
       .catch(() => { /* badge is decorative — stay silent */ });
     load();
-    const interval = setInterval(load, 60_000); // refresh every minute
-    return () => { cancelled = true; clearInterval(interval); };
+    // Instant refresh on SSE verification-queue pushes; 60s poll as
+    // fallback for dropped or reconnecting streams.
+    const onQueueEvent = () => load();
+    window.addEventListener(SPARK_QUEUE_EVENT, onQueueEvent);
+    const interval = setInterval(load, 60_000);
+    return () => { cancelled = true; window.removeEventListener(SPARK_QUEUE_EVENT, onQueueEvent); clearInterval(interval); };
   }, [currentRole]);
 
   const studentNav = [
