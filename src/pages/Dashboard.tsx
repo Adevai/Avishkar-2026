@@ -62,8 +62,72 @@ import {
   Lock,
   Clock,
   BadgeCheck,
-  ShieldAlert
+  ShieldAlert,
+  FileText,
+  Loader2
 } from 'lucide-react';
+
+/**
+ * Banner shown to college/industry accounts rejected at the admin desk:
+ * explains why and offers a signed-link re-download of their own uploaded
+ * certificate so they can inspect and re-submit it.
+ */
+const RejectedVerificationBanner: React.FC = () => {
+  const { setNotification } = useApp();
+  const [dismissed, setDismissed] = React.useState<boolean>(() => {
+    try { return sessionStorage.getItem('spark_rejected_banner_dismissed') === '1'; } catch { return false; }
+  });
+  const [busy, setBusy] = React.useState(false);
+
+  const reDownload = async () => {
+    setBusy(true);
+    try {
+      const { url } = await api.getMyDocumentUrl();
+      window.open(url, '_blank', 'noopener');
+    } catch (err: any) {
+      setNotification(err.message || 'Could not open your certificate.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (dismissed) return null;
+
+  return (
+    <div className="mb-6 p-4 rounded-2xl bg-rose-50/90 border border-rose-300 flex items-start gap-3">
+      <ShieldAlert className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-bold text-rose-900 flex items-center gap-2">
+          Verification was not approved
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-200/70 text-rose-900">
+            REJECTED
+          </span>
+        </p>
+        <p className="text-xs text-rose-800 mt-1 leading-relaxed">
+          The platform admin could not verify your uploaded certificate — check the reason in your
+          notifications. You can re-download it below, then re-upload a corrected scan to resubmit.
+        </p>
+        <button
+          onClick={reDownload}
+          disabled={busy}
+          className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white border border-rose-300 hover:bg-rose-50 text-rose-700 text-xs font-bold disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+          Re-download my certificate
+        </button>
+      </div>
+      <button
+        onClick={() => {
+          setDismissed(true);
+          try { sessionStorage.setItem('spark_rejected_banner_dismissed', '1'); } catch { /* ignore */ }
+        }}
+        className="text-[11px] font-bold text-rose-700 hover:text-rose-900 underline shrink-0"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+};
 
 /**
  * Banner shown to students whose account is still awaiting their college's
@@ -165,6 +229,9 @@ export const Dashboard: React.FC = () => {
           
           {/* Pending college approval explainer (students) */}
           {currentRole === 'student' && <PendingApprovalBanner />}
+
+          {/* Rejected verification explainer + certificate re-download (college/industry) */}
+          {(currentRole === 'college' || currentRole === 'industry') && <RejectedVerificationBanner />}
 
           {/* Solution Workflow Interactive Visualizer (Linear Style Pipeline) */}
           {currentRole === 'student' && (

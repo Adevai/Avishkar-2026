@@ -11,6 +11,7 @@ import { Response } from 'express';
 
 export type SparkEventType =
   | 'application_update'
+  | 'new_application'
   | 'new_job'
   | 'job_update'
   | 'new_mou'

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
 import { api } from '../../services/api';
+import { SPARK_NEW_APPLICATION_EVENT } from '../../hooks/useSparkEvents';
 import { 
   Building2, 
   Users, 
@@ -80,6 +81,14 @@ export const IndustryDashboard: React.FC = () => {
   };
 
   useEffect(() => { loadMine(); }, []);
+
+  // Live candidates: a student applying to one of the recruiter's postings
+  // arrives as an SSE push (owner-targeted) — refresh without a reload.
+  useEffect(() => {
+    const onNewApp = () => loadMine();
+    window.addEventListener(SPARK_NEW_APPLICATION_EVENT, onNewApp);
+    return () => window.removeEventListener(SPARK_NEW_APPLICATION_EVENT, onNewApp);
+  }, []);
 
   const filteredMyJobs = myJobs.filter(j => {
     if (!postingSearch.trim()) return true;

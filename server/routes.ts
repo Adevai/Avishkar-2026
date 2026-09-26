@@ -234,10 +234,13 @@ router.get('/events', (req: Request, res: Response) => {
   });
   res.write(`event: connected\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
 
-  // Resolve the portal role from the bearer token (if any) so role-targeted
-  // events — e.g. verification-queue alerts for college/government desks —
-  // reach the right dashboards. Anonymous connections stay broadcast-only.
-  // EventSource cannot set headers, so the browser also passes ?token=.
+  // Resolve the caller identity from the bearer token (if any) so events
+  // route correctly: `sub` is the authoritative users.id for targeted events
+  // (the legacy ?userId= param carries profile ids that never match), and the
+  // portal role powers role-targeted desks. Anonymous connections keep the
+  // query userId and stay broadcast-only. EventSource cannot set headers,
+  // so the browser also passes ?token=.
+  let sseUser: string | null = (req.query.userId as string) || null;
   let sseRole: string | null = null;
   const authHeader = req.headers.authorization;
   const rawToken = authHeader?.startsWith('Bearer ')
@@ -246,12 +249,13 @@ router.get('/events', (req: Request, res: Response) => {
   if (rawToken) {
     try {
       const decoded: any = jwt.verify(rawToken, process.env.JWT_SECRET || 'spark-dev-secret');
+      sseUser = decoded.sub || sseUser;
       sseRole = decoded.role || null;
     } catch {
       // Invalid/expired token — connect as anonymous rather than failing the stream.
     }
   }
-  const clientId = addClient(res, (req.query.userId as string) || null, sseRole);
+  const clientId = addClient(res, sseUser, sseRole);
   req.on('close', () => removeClient(clientId));
 });
 
@@ -2439,7 +2443,7 @@ router.post('/applications', async (req: Request, res: Response) => {
   const { jobId, jobTitle, company, studentId, studentName, aiMatchScore, notes, attachedScorecardUrl, attachedResumeUrl } = req.body;
   try {
     // A closed/filled job must never accept new applications.
-    const jobState = await query(`SELECT status, title, company FROM jobs WHERE id = $1`, [jobId]);
+    const jobState = await query(`SELECT status, title, company, posted_by FROM jobs WHERE id = $1`, [jobId]);
     if (jobState.rows.length > 0 && jobState.rows[0].status && jobState.rows[0].status !== 'open') {
       return res.status(409).json({
         error: `${jobState.rows[0].title} at ${jobState.rows[0].company} is no longer accepting applications.`,
@@ -2479,6 +2483,19 @@ router.post('/applications', async (req: Request, res: Response) => {
       targetUserId: notifyUserId,
       data: { jobId, status: initialStatus },
     });
+
+    // Ping the posting's recruiter over SSE so their candidates list
+    // refreshes instantly. Owner-targeted (not role-broadcast) — applicant
+    // names must not leak to other companies.
+    if (jobState.rows[0]?.posted_by) {
+      emitEvent({
+        type: 'new_application',
+        title: 'New candidate received',
+        message: `${studentName || 'A student'} applied for ${jobTitle}.`,
+        targetUserId: jobState.rows[0].posted_by,
+        data: { jobId, applicationId: id, studentName: studentName || null },
+      });
+    }
 
     res.json({ success: true, application: result.rows[0] });
   } catch (error: any) {
@@ -3505,6 +3522,77 @@ router.get('/verify/admin-queue/:userId/document-url', requireAdmin, async (req:
   }
 });
 
+// Owner self-service: mint a signed link to YOUR OWN certificate (institution
+// or industry) so rejected accounts can re-download what they submitted from
+// the re-upload screen. Same 10-minute HMAC pattern as the admin desk.
+router.get('/verify/my-document-url', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const r = await query(`SELECT role FROM users WHERE id = $1`, [user.sub]);
+    if (r.rows.length === 0) return res.status(404).json({ error: 'Account not found.' });
+    const role = r.rows[0].role;
+    if (role !== 'college' && role !== 'industry') {
+      return res.status(403).json({ error: 'Only Institution and Industry accounts have verification certificates.' });
+    }
+    const doc = role === 'college'
+      ? await query(`SELECT affiliation_document_url AS doc FROM institutions WHERE user_id = $1`, [user.sub])
+      : await query(`SELECT incorporation_document_url AS doc FROM industries WHERE user_id = $1`, [user.sub]);
+    if (!doc.rows[0]?.doc) return res.status(404).json({ error: 'No certificate on file yet — upload one first.' });
+    const expires = Date.now() + 10 * 60_000;
+    const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-secret').update(`${user.sub}:${expires}`).digest('hex').slice(0, 32);
+    res.json({ success: true, url: `/api/verify/documents/${user.sub}?expires=${expires}&sig=${sig}`, expiresInMinutes: 10 });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to create your document link.' });
+  }
+});
+
+// Ops: uploads disk usage by subdirectory (resumes vs verify) + oldest file
+// age — backs the DEPLOYMENT.md disk-watch checklist item.
+router.get('/ops/uploads-usage', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const dir = String(req.query.dir || '').trim();
+    const roots = dir
+      ? [path.join(UPLOADS_ROOT, dir)]
+      : ['resumes', 'verify'].map(sub => path.join(UPLOADS_ROOT, sub));
+
+    const directories: { directory: string; fileCount: number; totalBytes: number; oldestFileAt: string | null }[] = [];
+    for (const root of roots) {
+      let fileCount = 0;
+      let totalBytes = 0;
+      let oldest: number | null = null;
+      if (fs.existsSync(root)) {
+        const entries = await fs.promises.readdir(root);
+        for (const entry of entries) {
+          const full = path.join(root, entry);
+          const st = await fs.promises.stat(full).catch(() => null);
+          if (!st || !st.isFile()) continue;
+          fileCount += 1;
+          totalBytes += st.size;
+          if (oldest === null || st.mtimeMs < oldest) oldest = st.mtimeMs;
+        }
+      }
+      directories.push({
+        directory: path.basename(root),
+        fileCount,
+        totalBytes,
+        oldestFileAt: oldest === null ? null : new Date(oldest).toISOString(),
+      });
+    }
+
+    const grandTotal = directories.reduce((s, d) => s + d.totalBytes, 0);
+    res.json({
+      success: true,
+      uploadsRoot: UPLOADS_ROOT,
+      directories,
+      totalBytes: grandTotal,
+      totalHuman: `${(grandTotal / 1_048_576).toFixed(1)} MB`,
+      perFileCapBytes: 15 * 1024 * 1024,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Signed certificate download (HMAC like resumes; link holder only).
 router.get('/verify/documents/:userId', async (req: Request, res: Response) => {
   const { expires, sig } = req.query as { expires?: string; sig?: string };
@@ -3534,10 +3622,23 @@ router.get('/verify/documents/:userId', async (req: Request, res: Response) => {
 });
 
 // Platform Admin: verify / reject an institution or industry account.
+// Rejections carry a structured reason (clean stats) plus an optional note.
+const REJECTION_REASONS = ['invalid_cin', 'unreadable_scan', 'wrong_institution', 'domain_mismatch', 'incomplete_document'] as const;
+const REJECTION_REASON_LABELS: Record<string, string> = {
+  invalid_cin: 'Invalid CIN/GSTIN',
+  unreadable_scan: 'Certificate scan unreadable',
+  wrong_institution: 'Wrong institution / account mismatch',
+  domain_mismatch: 'Email domain does not match institution',
+  incomplete_document: 'Document incomplete or missing pages',
+};
+
 router.patch('/verify/admin-queue/:userId', requireAdmin, async (req: Request, res: Response) => {
-  const { decision, reviewNote } = req.body || {};
+  const { decision, reviewNote, rejectionReason } = req.body || {};
   if (!['verified', 'rejected'].includes(decision)) {
     return res.status(400).json({ error: "decision must be 'verified' or 'rejected'." });
+  }
+  if (decision === 'rejected' && rejectionReason && !REJECTION_REASONS.includes(rejectionReason)) {
+    return res.status(400).json({ error: `rejectionReason must be one of: ${REJECTION_REASONS.join(', ')}.` });
   }
   try {
     const admin = (req as any).user;
@@ -3550,16 +3651,17 @@ router.patch('/verify/admin-queue/:userId', requireAdmin, async (req: Request, r
     if (acct.verification_status === 'verified' && decision === 'verified') {
       return res.status(409).json({ error: 'Account is already verified.' });
     }
+    const reasonLabel = rejectionReason ? (REJECTION_REASON_LABELS[rejectionReason] || null) : null;
     await query(`UPDATE users SET verification_status = $2 WHERE id = $1`, [acct.id, decision]);
     await query(
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, 'ADMIN_VERIFICATION_DECISION', $2)`,
-      [admin.email || admin.sub, JSON.stringify({ targetUserId: acct.id, targetEmail: acct.email, role: acct.role, decision, note: reviewNote || null })]
+      [admin.email || admin.sub, JSON.stringify({ targetUserId: acct.id, targetEmail: acct.email, role: acct.role, decision, reason: rejectionReason || null, note: reviewNote || null })]
     ).catch(() => {});
     insertNotification(acct.id,
       decision === 'verified' ? 'Account Verified ✓' : 'Verification Rejected',
       decision === 'verified'
         ? `Your ${acct.role === 'college' ? 'institution' : 'company'} account is now verified. Welcome aboard!`
-        : `Your verification was not approved.${reviewNote ? ` Note: ${reviewNote}` : ''} You can re-upload documents and resubmit.`,
+        : `Your verification was not approved${reasonLabel ? ` — ${reasonLabel.toLowerCase()}` : ''}.${reviewNote ? ` Note: ${reviewNote}` : ''} You can re-download your certificate and re-upload documents and resubmit.`,
       decision === 'verified' ? 'success' : 'alert'
     );
     // Rejected accounts head back to this desk for a fresh review.
@@ -3625,12 +3727,25 @@ router.get('/verify/admin-stats', requireAdmin, async (req: Request, res: Respon
           ? durations[mid]
           : (durations[mid - 1] + durations[mid]) / 2;
 
-      // Rejection reasons from the decision notes (top 5, most frequent first).
+      // Rejection reasons from the structured reason field, falling back to
+      // free-text notes from before the picker existed (top 5, most frequent).
       const rejects = await query(
-        `SELECT details ->> 'note' AS reason, count(*)::int AS n
-           FROM audit_logs
-          WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'decision' = 'rejected'
-          GROUP BY 1 ORDER BY n DESC, 1 ASC LIMIT 5`
+        `SELECT reason, count(*)::int AS n FROM (
+           SELECT COALESCE(
+             CASE details ->> 'reason'
+               WHEN 'invalid_cin' THEN 'Invalid CIN/GSTIN'
+               WHEN 'unreadable_scan' THEN 'Certificate scan unreadable'
+               WHEN 'wrong_institution' THEN 'Wrong institution / account mismatch'
+               WHEN 'domain_mismatch' THEN 'Email domain does not match institution'
+               WHEN 'incomplete_document' THEN 'Document incomplete or missing pages'
+               ELSE NULL END,
+             NULLIF(details ->> 'note', '')
+           ) AS reason
+             FROM audit_logs
+            WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'decision' = 'rejected'
+         ) t
+         WHERE reason IS NOT NULL
+         GROUP BY reason ORDER BY n DESC, reason ASC LIMIT 5`
       );
 
       return res.json({

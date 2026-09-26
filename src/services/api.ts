@@ -484,15 +484,37 @@ export const api = {
     return await res.json();
   },
 
-  async decideAdminVerification(userId: string, decision: 'verified' | 'rejected', reviewNote?: string): Promise<{ success: boolean; status: string }> {
+  async decideAdminVerification(userId: string, decision: 'verified' | 'rejected', reviewNote?: string, rejectionReason?: string): Promise<{ success: boolean; status: string }> {
     const res = await authFetch(`${API_BASE}/verify/admin-queue/${encodeURIComponent(userId)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision, reviewNote }),
+      body: JSON.stringify({ decision, reviewNote, rejectionReason }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Decision failed');
     return data;
+  },
+
+  /** Owner self-service: signed link to the caller's own verification certificate. */
+  async getMyDocumentUrl(): Promise<{ success: boolean; url: string; expiresInMinutes: number }> {
+    const res = await authFetch(`${API_BASE}/verify/my-document-url`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to create your document link');
+    return data;
+  },
+
+  /** Ops: uploads disk usage by subdirectory (admin-only). */
+  async getUploadsUsage(dir?: string): Promise<{
+    success: boolean;
+    uploadsRoot: string;
+    directories: { directory: string; fileCount: number; totalBytes: number; oldestFileAt: string | null }[];
+    totalBytes: number;
+    totalHuman: string;
+    perFileCapBytes: number;
+  }> {
+    const res = await authFetch(`${API_BASE}/ops/uploads-usage${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`);
+    if (!res.ok) throw new Error('Failed to load uploads usage');
+    return await res.json();
   },
 
   async getCollegeApprovals(): Promise<{ success: boolean; students: any[]; alumniApplications: any[] }> {

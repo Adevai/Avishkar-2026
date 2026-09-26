@@ -7,6 +7,15 @@ import { api } from '../../services/api';
 import { useApp } from '../../context/AppContext';
 import { SPARK_QUEUE_EVENT } from '../../hooks/useSparkEvents';
 
+/** Structured rejection reasons — mirrored server-side for clean stats. */
+const REJECTION_REASONS: { value: string; label: string }[] = [
+  { value: 'invalid_cin', label: 'Invalid CIN/GSTIN' },
+  { value: 'unreadable_scan', label: 'Certificate scan unreadable' },
+  { value: 'wrong_institution', label: 'Wrong institution / account mismatch' },
+  { value: 'domain_mismatch', label: 'Email domain does not match institution' },
+  { value: 'incomplete_document', label: 'Document incomplete or missing pages' },
+];
+
 interface AdminQueueAccount {
   id: string;
   name: string;
@@ -99,6 +108,7 @@ export const AdminVerificationPanel: React.FC = () => {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [docBusyId, setDocBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [rejectReasons, setRejectReasons] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -128,12 +138,19 @@ export const AdminVerificationPanel: React.FC = () => {
   }, [load]);
 
   const decide = async (acct: AdminQueueAccount, decision: 'verified' | 'rejected') => {
+    // Rejections require a structured reason so the stats stay clean.
+    if (decision === 'rejected' && !rejectReasons[acct.id]) {
+      setNotification('Pick a rejection reason first — it keeps the stats meaningful.');
+      return;
+    }
     setBusyId(acct.id);
     try {
-      await api.decideAdminVerification(acct.id, decision);
+      const reason = decision === 'rejected' ? (rejectReasons[acct.id] || undefined) : undefined;
+      await api.decideAdminVerification(acct.id, decision, undefined, reason);
       setNotification(decision === 'verified'
         ? `${acct.name} verified — they've been notified.`
         : `${acct.name} rejected. They can re-upload documents and resubmit.`);
+      setRejectReasons(prev => { const next = { ...prev }; delete next[acct.id]; return next; });
       await load();
     } catch (err: any) {
       setNotification(err.message || 'Action failed.');
@@ -256,10 +273,27 @@ export const AdminVerificationPanel: React.FC = () => {
               <button
                 onClick={() => decide(acct, 'rejected')}
                 disabled={busyId === acct.id}
+                title={rejectReasons[acct.id] ? undefined : 'Pick a rejection reason first'}
                 className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white border border-slate-300 hover:bg-rose-50 text-rose-700 text-xs font-bold disabled:opacity-50"
               >
                 <XCircle className="w-3.5 h-3.5" /> Reject
               </button>
+              {/* Structured reason picker — keeps the stats breakdown clean */}
+              <div className="basis-full -mt-1 flex items-center gap-2">
+                <label className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 shrink-0">
+                  Rejection reason
+                </label>
+                <select
+                  value={rejectReasons[acct.id] || ''}
+                  onChange={e => setRejectReasons(prev => ({ ...prev, [acct.id]: e.target.value }))}
+                  className="text-xs rounded-lg border border-slate-200 bg-white px-2 py-1 text-slate-700 focus:outline-none focus:ring-2 focus:ring-rose-200"
+                >
+                  <option value="">— select a reason —</option>
+                  {REJECTION_REASONS.map(r => (
+                    <option key={r.value} value={r.value}>{r.label}</option>
+                  ))}
+                </select>
+              </div>
             </div>
           </div>
         );
@@ -267,7 +301,7 @@ export const AdminVerificationPanel: React.FC = () => {
 
       <p className="text-[10px] text-slate-400">
         Certificates open through expiring signed links (10 minutes) — direct document URLs are never exposed.
-        Decisions are audit-logged and the account is notified instantly.
+        Decisions are audit-logged with a structured reason and the account is notified instantly.
       </p>
     </div>
   );

@@ -946,6 +946,123 @@ describe('Portal role verification matrix', () => {
       await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [statEmail]).catch(() => {});
     }
   });
+
+  dbIt('structured rejection reasons: recorded, served in stats, validated', async () => {
+    const rrEmail = `e2e-rr-${stamp}@rr.test`;
+    const reg = await registerViaOtp({
+      role: 'industry', name: 'E2E RR Corp', email: rrEmail, password: 'Rr@2026',
+      company: 'RR Corp', incorporationDocument: '/uploads/verify/rr.pdf',
+    });
+    expect(reg).toBe(200);
+    const uRow = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [rrEmail]);
+    const userId = uRow.rows[0].id;
+
+    try {
+      // Unknown reason values are rejected with 400.
+      const bad = await request(app)
+        .patch(`/api/verify/admin-queue/${userId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ decision: 'rejected', rejectionReason: 'made_up_reason' });
+      expect(bad.status).toBe(400);
+
+      const reject = await request(app)
+        .patch(`/api/verify/admin-queue/${userId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ decision: 'rejected', rejectionReason: 'unreadable_scan' });
+      expect(reject.status).toBe(200);
+
+      // The audit row carries the structured reason (not just free text).
+      const audit = await pool.query(
+        `SELECT details ->> 'reason' AS reason FROM audit_logs
+          WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'targetUserId' = $1
+          ORDER BY created_at DESC LIMIT 1`,
+        [userId]
+      );
+      expect(audit.rows[0]?.reason).toBe('unreadable_scan');
+
+      // Stats map the reason code to its human label.
+      const stats = await request(app).get('/api/verify/admin-stats').set('Authorization', `Bearer ${adminToken}`);
+      expect(stats.status).toBe(200);
+      const label = stats.body.rejectionReasons.find((r: any) => r.reason === 'Certificate scan unreadable');
+      expect(label).toBeTruthy();
+      expect(label.count).toBeGreaterThanOrEqual(1);
+    } finally {
+      await pool.query(`DELETE FROM audit_logs WHERE action = 'ADMIN_VERIFICATION_DECISION' AND details ->> 'targetUserId' = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM industries WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [rrEmail]).catch(() => {});
+    }
+  });
+
+  dbIt('owner self-service certificate link: own cert works, others cannot mint or view', async () => {
+    const ownEmail = `e2e-own-${stamp}@own.test`;
+    const uploadsDir = path.resolve(process.cwd(), 'uploads', 'verify');
+    await fs.promises.mkdir(uploadsDir, { recursive: true });
+    const certPath = path.join(uploadsDir, `e2e-own-${stamp}.pdf`);
+    await fs.promises.writeFile(certPath, '%PDF-1.4 owner self-service cert', 'utf8');
+
+    const reg = await registerViaOtp({
+      role: 'industry', name: 'E2E Own Corp', email: ownEmail, password: 'Own@2026',
+      company: 'Own Corp', incorporationDocument: certPath,
+    });
+    expect(reg).toBe(200);
+    const uRow = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [ownEmail]);
+    const userId = uRow.rows[0].id;
+    const ownToken = (await request(app).post('/api/login').send({ email: ownEmail, password: 'Own@2026' })).body.token;
+
+    try {
+      const mint = await request(app).get('/api/verify/my-document-url').set('Authorization', `Bearer ${ownToken}`);
+      expect(mint.status).toBe(200);
+      expect(mint.body.url).toContain(`/api/verify/documents/${userId}`);
+
+      const dl = await request(app).get(mint.body.url).parse(rawBody);
+      expect(dl.status).toBe(200);
+      expect(dl.body).toContain('%PDF-1.4 owner self-service cert');
+
+      // Students have no certificate surface at all.
+      const stuLogin = await request(app).post('/api/login').send({ email: acStudentEmail, password: 'AcStu@2026' });
+      const forbidden = await request(app).get('/api/verify/my-document-url').set('Authorization', `Bearer ${stuLogin.body.token}`);
+      expect(forbidden.status).toBe(403);
+
+      // The signed URL itself stays public-but-HMAC'd (no auth needed to view).
+      const noAuth = await request(app).get(mint.body.url);
+      expect(noAuth.status).toBe(200);
+    } finally {
+      await fs.promises.rm(certPath, { force: true }).catch(() => {});
+      await pool.query(`DELETE FROM industries WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [ownEmail]).catch(() => {});
+    }
+  });
+
+  dbIt('ops uploads-usage: admin sees per-directory stats, others blocked', async () => {
+    const anon = await request(app).get('/api/ops/uploads-usage');
+    expect(anon.status).toBe(401);
+
+    const stuLogin = await request(app).post('/api/login').send({ email: acStudentEmail, password: 'AcStu@2026' });
+    const forbidden = await request(app).get('/api/ops/uploads-usage').set('Authorization', `Bearer ${stuLogin.body.token}`);
+    expect(forbidden.status).toBe(403);
+
+    const res = await request(app).get('/api/ops/uploads-usage').set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.directories)).toBe(true);
+    const names = res.body.directories.map((d: any) => d.directory).sort();
+    expect(names).toEqual(['resumes', 'verify']);
+    for (const d of res.body.directories) {
+      expect(d.fileCount).toBeGreaterThanOrEqual(0);
+      expect(d.totalBytes).toBeGreaterThanOrEqual(0);
+    }
+    expect(res.body.totalHuman).toMatch(/MB$/);
+
+    // ?dir= narrows to a single subdirectory.
+    const only = await request(app).get('/api/ops/uploads-usage?dir=verify').set('Authorization', `Bearer ${adminToken}`);
+    expect(only.status).toBe(200);
+    expect(only.body.directories).toHaveLength(1);
+    expect(only.body.directories[0].directory).toBe('verify');
+  });
 });
 
 // ── JOB OWNERSHIP + LIFECYCLE + PAGINATION ───────────────────────────────────

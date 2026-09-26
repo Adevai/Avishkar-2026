@@ -12,7 +12,7 @@ import { getToken } from '../services/api';
  */
 
 export interface SparkEventPayload {
-  type: 'application_update' | 'new_job' | 'new_mou' | 'new_problem' | 'assessment_result' | 'verification_queue' | 'notification';
+  type: 'application_update' | 'new_application' | 'new_job' | 'new_mou' | 'new_problem' | 'assessment_result' | 'verification_queue' | 'notification';
   title: string;
   message: string;
   targetUserId?: string | null;
@@ -23,6 +23,8 @@ export interface SparkEventPayload {
 
 /** Window event fired whenever a verification-queue push arrives (SSE consumers re-fetch). */
 export const SPARK_QUEUE_EVENT = 'spark:verification-queue';
+/** Window event fired when a candidate applies to one of the recruiter's postings. */
+export const SPARK_NEW_APPLICATION_EVENT = 'spark:new-application';
 
 export function useSparkEvents() {
   const { setNotification, student } = useApp();
@@ -54,6 +56,12 @@ export function useSparkEvents() {
         // Verification-queue updates → badge/desk refresh via window event
         if (evt.type === 'verification_queue') {
           window.dispatchEvent(new CustomEvent(SPARK_QUEUE_EVENT, { detail: evt }));
+        }
+
+        // A candidate applied to one of the recruiter's postings → their
+        // candidates list refreshes without a reload.
+        if (evt.type === 'new_application') {
+          window.dispatchEvent(new CustomEvent(SPARK_NEW_APPLICATION_EVENT, { detail: evt }));
         }
       } catch {
         // Malformed frame — ignore
