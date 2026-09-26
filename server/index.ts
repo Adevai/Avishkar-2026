@@ -154,11 +154,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// ── Verification documents (affiliation/incorporation certificates) ─────────
-// Public read for reviewers; files are unguessable timestamped names. Serve
-// before the SPA fallback so document links resolve.
-app.use('/uploads/verify', express.static(path.join(process.cwd(), 'uploads', 'verify'), { maxAge: '1h' }));
-
 // ── Production static serving: the Express host serves the built frontend ────
 // ESM-safe dirname: __dirname is undefined under tsx/ESM, so derive the server
 // directory from the entry script path (works under tsx, ts-node, and CJS).

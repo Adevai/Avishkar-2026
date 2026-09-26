@@ -459,6 +459,19 @@ export const api = {
     return await res.json();
   },
 
+  async getVerificationDocumentUrl(userId: string): Promise<{ success: boolean; url: string; expiresInMinutes: number }> {
+    const res = await authFetch(`${API_BASE}/verify/admin-queue/${encodeURIComponent(userId)}/document-url`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Failed to create the document link');
+    return data;
+  },
+
+  async getPendingApprovalCount(): Promise<{ success: boolean; students: number; alumni: number }> {
+    const res = await authFetch(`${API_BASE}/verify/pending-count`);
+    if (!res.ok) throw new Error('Failed to load pending counts');
+    return await res.json();
+  },
+
   async decideAdminVerification(userId: string, decision: 'verified' | 'rejected', reviewNote?: string): Promise<{ success: boolean; status: string }> {
     const res = await authFetch(`${API_BASE}/verify/admin-queue/${encodeURIComponent(userId)}`, {
       method: 'PATCH',

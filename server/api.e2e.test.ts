@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import request from 'supertest';
+import fs from 'fs';
+import path from 'path';
 
 /**
  * End-to-end API tests via supertest.
@@ -81,6 +83,14 @@ const dbIt = (name: string, fn: () => Promise<void>) =>
     if (!dbAvailable) ctx.skip();
     await fn();
   });
+
+// supertest leaves binary bodies (e.g. application/pdf) with undefined .text —
+// collect the raw bytes ourselves so document downloads can be asserted on.
+const rawBody = (res: any, cb: (err: any, body?: string) => void) => {
+  const chunks: Buffer[] = [];
+  res.on('data', (c: Buffer) => chunks.push(c));
+  res.on('end', () => cb(null, Buffer.concat(chunks).toString('utf8')));
+};
 
 // applications.student_id has a FK to students.id — make sure every referenced
 // fixture student exists so the suite is self-sufficient on a fresh database.
@@ -717,6 +727,170 @@ describe('Portal role verification matrix', () => {
     expect(enable.status).toBe(200);
     expect(enable.body.profile.is_mentor).toBe(true);
     expect(enable.body.profile.mentor_tech_stack).toEqual(['React', 'Kubernetes']);
+  });
+
+  dbIt('pending-count badge endpoint: college gets live counts, other roles are blocked', async () => {
+    // Seed one extra pending student so the badge number provably moves.
+    const extraEmail = `e2e-badge-stu-${stamp}@gmail.com`;
+    const reg = await registerViaOtp({
+      role: 'student', name: 'E2E Badge Student', email: extraEmail, password: 'Bdg@2026',
+      college: 'Some Local Engineering College', degree: 'B.Tech', branch: 'CSE', semester: 2, cgpa: 7.0,
+    });
+    expect(reg).toBe(200);
+
+    const before = await request(app).get('/api/verify/pending-count').set('Authorization', `Bearer ${collegeToken}`);
+    expect(before.status).toBe(200);
+    expect(before.body.success).toBe(true);
+    expect(before.body.students).toBeGreaterThanOrEqual(1);
+    const studentCount = before.body.students;
+
+    // TPO approves the seeded student → the sidebar badge count drops by one.
+    const pending = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [extraEmail]);
+    const approve = await request(app)
+      .patch(`/api/verify/college-approvals/${pending.rows[0].id}`)
+      .set('Authorization', `Bearer ${collegeToken}`)
+      .send({ decision: 'verified', kind: 'student' });
+    expect(approve.status).toBe(200);
+
+    const after = await request(app).get('/api/verify/pending-count').set('Authorization', `Bearer ${collegeToken}`);
+    expect(after.status).toBe(200);
+    expect(after.body.students).toBe(studentCount - 1);
+
+    // The badge endpoint is college-only; government, students and anon get bounced.
+    const asAdmin = await request(app).get('/api/verify/pending-count').set('Authorization', `Bearer ${adminToken}`);
+    expect(asAdmin.status).toBe(403);
+    const stuLogin = await request(app).post('/api/login').send({ email: acStudentEmail, password: 'AcStu@2026' });
+    const asStudent = await request(app).get('/api/verify/pending-count').set('Authorization', `Bearer ${stuLogin.body.token}`);
+    expect(asStudent.status).toBe(403);
+    const anon = await request(app).get('/api/verify/pending-count');
+    expect(anon.status).toBe(401);
+
+    // Cleanup the seeded student.
+    await pool.query(`DELETE FROM students WHERE LOWER(email) = $1`, [extraEmail]).catch(() => {});
+    await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [pending.rows[0].id]).catch(() => {});
+    await pool.query(`DELETE FROM users WHERE id = $1`, [pending.rows[0].id]).catch(() => {});
+    await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [extraEmail]).catch(() => {});
+  });
+
+  dbIt('verification certificates: signed-URL flow with admin gating, expiry and tamper checks', async () => {
+    // Industry startup account whose certificate sits on an absolute path
+    // (the resume persistence pattern). Signup accepts any truthy marker.
+    const docEmail = `e2e-doc-${stamp}@cooldoc.test`;
+    const uploadsDir = path.resolve(process.cwd(), 'uploads', 'verify');
+    await fs.promises.mkdir(uploadsDir, { recursive: true });
+    const certPath = path.join(uploadsDir, `e2e-cert-${stamp}.pdf`);
+    await fs.promises.writeFile(certPath, '%PDF-1.4 e2e certificate', 'utf8');
+
+    const reg = await registerViaOtp({
+      role: 'industry', name: 'E2E Doc Corp', email: docEmail, password: 'Doc@2026',
+      company: 'Doc Corp', incorporationDocument: certPath,
+    });
+    expect(reg).toBe(200);
+    const uRow = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [docEmail]);
+    const userId = uRow.rows[0].id;
+
+    try {
+      // Queue listing is sanitized: no raw document paths, hasDocument exposed.
+      const queue = await request(app).get('/api/verify/admin-queue').set('Authorization', `Bearer ${adminToken}`);
+      expect(queue.status).toBe(200);
+      const acct = queue.body.accounts.find((a: any) => a.id === userId);
+      expect(acct).toBeTruthy();
+      expect(acct.hasDocument).toBe(true);
+      expect(JSON.stringify(queue.body)).not.toContain('incorporation_document_url');
+
+      // Minting a signed URL is admin-only.
+      const stuLogin = await request(app).post('/api/login').send({ email: acStudentEmail, password: 'AcStu@2026' });
+      const forbidden = await request(app)
+        .get(`/api/verify/admin-queue/${userId}/document-url`)
+        .set('Authorization', `Bearer ${stuLogin.body.token}`);
+      expect(forbidden.status).toBe(403);
+
+      const mint = await request(app)
+        .get(`/api/verify/admin-queue/${userId}/document-url`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(mint.status).toBe(200);
+      expect(mint.body.url).toContain(`/api/verify/documents/${userId}`);
+
+      // Valid signature serves the bytes; tampered/expired ones are 403.
+      const fresh = await request(app).get(mint.body.url).parse(rawBody);
+      expect(fresh.status).toBe(200);
+      expect(fresh.body).toContain('%PDF-1.4');
+
+      const tampered = await request(app).get(mint.body.url.replace(/sig=.*/, 'sig=deadbeefdeadbeefdeadbeefdeadbeef'));
+      expect(tampered.status).toBe(403);
+
+      const expired = await request(app).get(mint.body.url.replace(/expires=\d+/, `expires=${Date.now() - 1000}`));
+      expect(expired.status).toBe(403);
+
+      // The public /uploads/verify static mount is gone — raw paths never leak bytes.
+      const legacy = await request(app).get('/uploads/verify/e2e-cert.pdf');
+      expect(legacy.status === 200 && String(legacy.text).includes('%PDF-1.4')).toBe(false);
+    } finally {
+      await fs.promises.rm(certPath, { force: true }).catch(() => {});
+      await pool.query(`DELETE FROM industries WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [docEmail]).catch(() => {});
+    }
+  });
+
+  dbIt('affiliation-document upload stores an absolute path under uploads/verify and re-enters the admin queue', async () => {
+    const upEmail = `e2e-updoc-${stamp}@upload.test`;
+    const reg = await registerViaOtp({
+      role: 'industry', name: 'E2E Upload Corp', email: upEmail, password: 'Up@2026',
+      company: 'Upload Corp', incorporationDocument: 'awaiting-upload',
+    });
+    expect(reg).toBe(200);
+    const uRow = await pool.query(`SELECT id FROM users WHERE LOWER(email) = $1`, [upEmail]);
+    const userId = uRow.rows[0].id;
+    const token = (await request(app).post('/api/login').send({ email: upEmail, password: 'Up@2026' })).body.token;
+    expect(token).toBeTruthy();
+
+    try {
+      // Admin rejects the startup once; the re-upload must reopen the queue.
+      const reject = await request(app)
+        .patch(`/api/verify/admin-queue/${userId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ decision: 'rejected', reviewNote: 'Certificate unreadable.' });
+      expect(reject.status).toBe(200);
+      let vs = await pool.query(`SELECT verification_status FROM users WHERE id = $1`, [userId]);
+      expect(vs.rows[0]?.verification_status).toBe('rejected');
+
+      const up = await request(app)
+        .post('/api/verify/affiliation-document')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('document', Buffer.from('%PDF-1.4 fresh affiliation letter'), { filename: 'affiliation letter.pdf', contentType: 'application/pdf' });
+      expect(up.status).toBe(200);
+      expect(up.body.success).toBe(true);
+      expect(up.body.stored).toBe(true);
+
+      vs = await pool.query(`SELECT verification_status FROM users WHERE id = $1`, [userId]);
+      expect(vs.rows[0]?.verification_status).toBe('pending_admin_approval');
+
+      const ind = await pool.query(`SELECT incorporation_document_url FROM industries WHERE user_id = $1`, [userId]);
+      const stored = ind.rows[0]?.incorporation_document_url || '';
+      expect(path.isAbsolute(stored)).toBe(true);
+      expect(stored.replace(/\\/g, '/')).toContain('/uploads/verify/');
+      expect(await fs.promises.readFile(stored, 'utf8')).toContain('%PDF-1.4 fresh affiliation letter');
+      // Filename is prefixed with the account id (JWT `sub`), never `undefined`.
+      expect(path.basename(stored).startsWith(userId)).toBe(true);
+
+      // Admin can open the fresh certificate through a signed URL.
+      const mint = await request(app)
+        .get(`/api/verify/admin-queue/${userId}/document-url`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(mint.status).toBe(200);
+      const dl = await request(app).get(mint.body.url).parse(rawBody);
+      expect(dl.status).toBe(200);
+      expect(dl.body).toContain('%PDF-1.4');
+
+      await fs.promises.rm(stored, { force: true }).catch(() => {});
+    } finally {
+      await pool.query(`DELETE FROM industries WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE id = $1`, [userId]).catch(() => {});
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [upEmail]).catch(() => {});
+    }
   });
 });
 

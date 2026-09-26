@@ -3371,16 +3371,18 @@ router.post('/verify/affiliation-document', requireAuth, upload.single('document
     if (role !== 'industry' && role !== 'college') {
       return res.status(403).json({ error: 'Only Institution and Industry accounts can submit verification documents.' });
     }
-    const safeName = req.file.originalname.replace(/[^A-Za-z0-9._-]/g, '_').slice(-80);
-    const docUrl = `/uploads/verify/${Date.now()}-${safeName}`;
-    const absPath = path.join(process.cwd(), docUrl);
-    fs.mkdirSync(path.dirname(absPath), { recursive: true });
-    fs.writeFileSync(absPath, req.file.buffer);
+    // Same persistence pattern as resumes: absolute path on disk under
+    // uploads/verify, served ONLY through expiring signed URLs.
+    const docDir = path.resolve(process.cwd(), 'uploads', 'verify');
+    await fs.promises.mkdir(docDir, { recursive: true });
+    const safeName = `${user.sub}-${Date.now()}-${req.file.originalname.replace(/[^A-Za-z0-9._-]/g, '_').slice(-80)}`;
+    const docPath = path.join(docDir, safeName);
+    await fs.promises.writeFile(docPath, req.file.buffer);
 
     if (role === 'college') {
-      await query(`UPDATE institutions SET affiliation_document_url = $2 WHERE user_id = $1`, [user.sub, docUrl]);
+      await query(`UPDATE institutions SET affiliation_document_url = $2 WHERE user_id = $1`, [user.sub, docPath]);
     } else {
-      await query(`UPDATE industries SET incorporation_document_url = $2 WHERE user_id = $1`, [user.sub, docUrl]);
+      await query(`UPDATE industries SET incorporation_document_url = $2 WHERE user_id = $1`, [user.sub, docPath]);
     }
     // Document submitted → (re)enter the admin approval queue.
     await query(`UPDATE users SET verification_status = 'pending_admin_approval' WHERE id = $1 AND verification_status <> 'verified'`, [user.sub]);
@@ -3388,7 +3390,7 @@ router.post('/verify/affiliation-document', requireAuth, upload.single('document
       `INSERT INTO audit_logs (actor, action, details) VALUES ($1, $2, $3)`,
       [user.sub, role === 'college' ? 'AFFILIATION_DOC_UPLOADED' : 'INCORPORATION_DOC_UPLOADED', JSON.stringify({ file: safeName, size: req.file.size })]
     ).catch(() => {});
-    res.json({ success: true, documentUrl: docUrl, status: 'pending_admin_approval' });
+    res.json({ success: true, stored: true, status: 'pending_admin_approval' });
   } catch (error: any) {
     console.error('affiliation document upload failed:', error.message);
     res.status(500).json({ error: 'Failed to store the document.' });
@@ -3409,9 +3411,72 @@ router.get('/verify/admin-queue', requireAdmin, async (req: Request, res: Respon
         ORDER BY u.created_at ASC
         LIMIT 200`
     );
-    res.json({ success: true, accounts: r.rows });
+    // Raw document paths stay server-side; clients mint expiring signed URLs.
+    const accounts = r.rows.map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      email: row.email,
+      role: row.role,
+      verificationStatus: row.verification_status,
+      createdAt: row.created_at,
+      aisheCode: row.aishe_code || null,
+      officialDomain: row.official_domain || null,
+      cinGstin: row.cin_gstin || null,
+      hasDocument: !!(row.affiliation_document_url || row.incorporation_document_url),
+    }));
+    res.json({ success: true, accounts });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: mint a 10-minute signed URL for an account's verification certificate
+// (same HMAC pattern as resume downloads).
+router.get('/verify/admin-queue/:userId/document-url', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const r = await query(
+      `SELECT i.affiliation_document_url AS doc_a, ind.incorporation_document_url AS doc_b
+         FROM users u
+         LEFT JOIN institutions i ON i.user_id = u.id
+         LEFT JOIN industries ind ON ind.user_id = u.id
+        WHERE u.id = $1`,
+      [req.params.userId]
+    );
+    const docPath = r.rows[0]?.doc_a || r.rows[0]?.doc_b;
+    if (!docPath) return res.status(404).json({ error: 'No certificate on file for this account.' });
+    const expires = Date.now() + 10 * 60_000;
+    const sig = crypto.createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-secret').update(`${req.params.userId}:${expires}`).digest('hex').slice(0, 32);
+    res.json({ success: true, url: `/api/verify/documents/${req.params.userId}?expires=${expires}&sig=${sig}`, expiresInMinutes: 10 });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to create the document link.' });
+  }
+});
+
+// Signed certificate download (HMAC like resumes; link holder only).
+router.get('/verify/documents/:userId', async (req: Request, res: Response) => {
+  const { expires, sig } = req.query as { expires?: string; sig?: string };
+  const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || 'spark-dev-secret').update(`${req.params.userId}:${expires}`).digest('hex').slice(0, 32);
+  if (!expires || !sig || sig !== expected || Number(expires) < Date.now()) {
+    return res.status(403).json({ error: 'This document link has expired. Request a fresh one.' });
+  }
+  try {
+    const r = await query(
+      `SELECT i.affiliation_document_url AS doc_a, ind.incorporation_document_url AS doc_b
+         FROM users u
+         LEFT JOIN institutions i ON i.user_id = u.id
+         LEFT JOIN industries ind ON ind.user_id = u.id
+        WHERE u.id = $1`,
+      [req.params.userId]
+    );
+    const stored = r.rows[0]?.doc_a || r.rows[0]?.doc_b;
+    if (!stored) return res.status(404).json({ error: 'Document not found.' });
+    // Tolerate legacy relative URLs from earlier uploads.
+    const absPath = path.isAbsolute(stored) ? stored : path.join(process.cwd(), stored);
+    if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'Document file is missing.' });
+    res.setHeader('Content-Disposition', `inline; filename="${path.basename(absPath)}"`);
+    res.sendFile(absPath);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to serve the document.' });
   }
 });
 
@@ -3445,6 +3510,25 @@ router.patch('/verify/admin-queue/:userId', requireAdmin, async (req: Request, r
       decision === 'verified' ? 'success' : 'alert'
     );
     res.json({ success: true, status: decision });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Pending-approvals count for the college sidebar badge (cheap aggregate).
+router.get('/verify/pending-count', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const me = await query(`SELECT id FROM users WHERE id = $1 AND role = 'college'`, [user.sub]);
+    if (me.rows.length === 0) return res.status(403).json({ error: 'College (TPO) access required.' });
+    const students = await query(
+      `SELECT count(*)::int AS n FROM users WHERE verification_status = 'pending_college_approval'`
+    );
+    const alumni = await query(
+      `SELECT count(*)::int AS n FROM alumni_applications WHERE status = 'pending' AND review_note LIKE '%portal%'
+      `
+    );
+    res.json({ success: true, students: students.rows[0]?.n || 0, alumni: alumni.rows[0]?.n || 0 });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

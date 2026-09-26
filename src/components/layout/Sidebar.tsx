@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { api } from '../../services/api';
 import {
   UserCheck,
   BrainCircuit,
@@ -30,6 +31,19 @@ import {
 
 export const Sidebar: React.FC = () => {
   const { currentRole, activeTab, setActiveTab, isAssessmentActive, setNotification } = useApp();
+  // Pending-approvals count drives the Approvals tab badge (college role).
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (currentRole !== 'college') { setPendingApprovals(0); return; }
+    const load = () => api.getPendingApprovalCount()
+      .then(r => { if (!cancelled) setPendingApprovals((r.students || 0) + (r.alumni || 0)); })
+      .catch(() => { /* badge is decorative — stay silent */ });
+    load();
+    const interval = setInterval(load, 60_000); // refresh every minute
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [currentRole]);
 
   const studentNav = [
     { id: 'profile', label: '1. Profile & Skills', icon: <UserCheck className="w-4 h-4" /> },
@@ -64,6 +78,7 @@ export const Sidebar: React.FC = () => {
   const governmentNav = [
     { id: 'overview', label: 'State Employability', icon: <Landmark className="w-4 h-4" /> },
     { id: 'verification-queue', label: 'Verification Review', icon: <ClipboardCheck className="w-4 h-4" /> },
+    { id: 'admin-desk', label: 'Admin Verification Desk', icon: <BadgeCheck className="w-4 h-4" /> },
     { id: 'nep2020', label: 'NEP 2020 Compliance', icon: <ShieldCheck className="w-4 h-4" /> },
     { id: 'skill-trends', label: 'Demand vs Supply', icon: <TrendingUp className="w-4 h-4" /> },
     { id: 'regional', label: 'Regional & Tier Analysis', icon: <BarChart3 className="w-4 h-4" /> },
@@ -134,6 +149,16 @@ export const Sidebar: React.FC = () => {
                   </span>
                   <span className="truncate">{item.label}</span>
                 </div>
+                {currentRole === 'college' && item.id === 'approvals' && pendingApprovals > 0 && (
+                  <span
+                    className={`shrink-0 ml-1 min-w-[20px] h-5 px-1.5 inline-flex items-center justify-center rounded-full text-[10px] font-extrabold ${
+                      isActive ? 'bg-white text-blue-700' : 'bg-rose-500 text-white animate-pulse'
+                    }`}
+                    title={`${pendingApprovals} pending approval(s)`}
+                  >
+                    {pendingApprovals > 99 ? '99+' : pendingApprovals}
+                  </span>
+                )}
                 {isLocked && <Lock className="w-3 h-3 text-blue-400 shrink-0 ml-1" />}
               </button>
             );

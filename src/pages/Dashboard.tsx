@@ -28,6 +28,7 @@ const TalentSearch = lazy(() => import('../components/industry/TalentSearch').th
 const ProblemStatements = lazy(() => import('../components/collaboration/ProblemStatements').then(m => ({ default: m.ProblemStatements })));
 const GovtDashboard = lazy(() => import('../components/government/GovtDashboard').then(m => ({ default: m.GovtDashboard })));
 const VerificationQueue = lazy(() => import('../components/government/VerificationQueue').then(m => ({ default: m.VerificationQueue })));
+const AdminVerificationPanel = lazy(() => import('../components/government/AdminVerificationPanel').then(m => ({ default: m.AdminVerificationPanel })));
 const WelcomeIntakeModal = lazy(() => import('../components/student/WelcomeIntakeModal').then(m => ({ default: m.WelcomeIntakeModal })));
 const MentorDashboard = lazy(() => import('../components/alumni/MentorDashboard').then(m => ({ default: m.MentorDashboard })));
 const StudentMentorship = lazy(() => import('../components/alumni/StudentMentorship').then(m => ({ default: m.StudentMentorship })));
@@ -48,7 +49,8 @@ const TabSuspense: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 
 import { useApp } from '../context/AppContext';
 import { useSparkEvents } from '../hooks/useSparkEvents';
-import { 
+import { api } from '../services/api';
+import {
   Cpu,
   UserCheck, 
   BrainCircuit, 
@@ -57,8 +59,61 @@ import {
   Briefcase, 
   FileCheck2,
   Zap,
-  Lock
+  Lock,
+  Clock,
+  BadgeCheck,
+  ShieldAlert
 } from 'lucide-react';
+
+/**
+ * Banner shown to students whose account is still awaiting their college's
+ * TPO approval (personal-email registrations). Fully functional browsing is
+ * allowed — the banner just explains why a "pending" chip appears.
+ */
+const PendingApprovalBanner: React.FC = () => {
+  const [status, setStatus] = React.useState<string | null>(null);
+  const [dismissed, setDismissed] = React.useState<boolean>(() => {
+    try { return sessionStorage.getItem('spark_pending_banner_dismissed') === '1'; } catch { return false; }
+  });
+
+  React.useEffect(() => {
+    let cancelled = false;
+    api.getVerificationStatus()
+      .then(r => { if (!cancelled) setStatus(r.verificationStatus || null); })
+      .catch(() => { /* banner is informational only */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  if (dismissed || status !== 'pending_college_approval') return null;
+
+  return (
+    <div className="mb-6 p-4 rounded-2xl bg-amber-50/90 border border-amber-300 flex items-start gap-3">
+      <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-bold text-amber-900 flex items-center gap-2">
+          Account pending college approval
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-200/70 text-amber-900">
+            <Clock className="w-3 h-3" /> PENDING_COLLEGE_APPROVAL
+          </span>
+        </p>
+        <p className="text-xs text-amber-800 mt-1 leading-relaxed">
+          You signed up with a personal email address, so your college's Training &amp; Placement office needs to
+          confirm you. Everything below still works — a verified badge appears automatically once they approve.
+          Registered with your college domain (e.g. @college.ac.in)? You'd be verified instantly.
+        </p>
+      </div>
+      <button
+        onClick={() => {
+          setDismissed(true);
+          try { sessionStorage.setItem('spark_pending_banner_dismissed', '1'); } catch { /* ignore */ }
+        }}
+        className="text-[11px] font-bold text-amber-700 hover:text-amber-900 underline shrink-0"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+};
 
 export const Dashboard: React.FC = () => {
   const { 
@@ -108,6 +163,9 @@ export const Dashboard: React.FC = () => {
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 min-w-0">
           
+          {/* Pending college approval explainer (students) */}
+          {currentRole === 'student' && <PendingApprovalBanner />}
+
           {/* Solution Workflow Interactive Visualizer (Linear Style Pipeline) */}
           {currentRole === 'student' && (
             <div className="mb-8 p-4 rounded-2xl bg-white border border-slate-200 shadow-sm hidden xl:block">
@@ -210,7 +268,9 @@ export const Dashboard: React.FC = () => {
 
             {currentRole === 'government' && (
               <TabSuspense>
-                {activeTab === 'verification-queue' ? <VerificationQueue /> : <GovtDashboard />}
+                {activeTab === 'verification-queue' && <VerificationQueue />}
+                {activeTab === 'admin-desk' && <AdminVerificationPanel />}
+                {activeTab !== 'verification-queue' && activeTab !== 'admin-desk' && <GovtDashboard />}
               </TabSuspense>
             )}
 
