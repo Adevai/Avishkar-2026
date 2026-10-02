@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { GOVT_REGIONAL_STATS, EMERGING_SKILL_TRENDS } from '../../data/mockData';
 import { api } from '../../services/api';
 import {
   Landmark,
@@ -29,18 +28,31 @@ import {
 } from 'recharts';
 
 export const GovtDashboard: React.FC = () => {
-  const [regionalStats, setRegionalStats] = useState(GOVT_REGIONAL_STATS);
-  const [skillTrends, setSkillTrends] = useState(EMERGING_SKILL_TRENDS);
+  const [regionalStats, setRegionalStats] = useState<any[]>([]);
+  const [skillTrends, setSkillTrends] = useState<any[]>([]);
+  const [loadingGovtStats, setLoadingGovtStats] = useState(true);
+  const [govtStatsError, setGovtStatsError] = useState(false);
+  const [syntheticCount, setSyntheticCount] = useState(0);
+  const [scope, setScope] = useState('');
 
+  // Real analytics only: the API result (even empty) replaces state verbatim.
+  // Government viewers are server-scoped to their jurisdiction.
   useEffect(() => {
+    let alive = true;
     api.getAnalytics().then(res => {
-      if (res.govtRegionalStats && res.govtRegionalStats.length > 0) {
-        setRegionalStats(res.govtRegionalStats);
-      }
-      if (res.emergingSkillTrends && res.emergingSkillTrends.length > 0) {
-        setSkillTrends(res.emergingSkillTrends);
-      }
-    }).catch(console.error);
+      if (!alive) return;
+      setRegionalStats(res.govtRegionalStats || []);
+      setSkillTrends(res.emergingSkillTrends || []);
+      setSyntheticCount(res.synthetic?.students || 0);
+      setScope(res.scope?.jurisdiction || '');
+      setLoadingGovtStats(false);
+    }).catch(err => {
+      console.error(err);
+      if (!alive) return;
+      setGovtStatsError(true);
+      setLoadingGovtStats(false);
+    });
+    return () => { alive = false; };
   }, []);
   const { activeTab, setActiveTab, setNotification } = useApp();
   const [selectedRegionFilter, setSelectedRegionFilter] = useState<string>('all');
@@ -130,6 +142,20 @@ export const GovtDashboard: React.FC = () => {
               <span className="text-xs text-blue-200">NEP 2020 Implementation Oversight</span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Policy & Macro-Analytics View</h1>
+            {(scope || syntheticCount !== 0) && (
+              <div className="flex flex-wrap items-center gap-2 mt-2">
+                {scope && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-500/20 border border-blue-300/30 text-blue-100 text-[10px] font-bold">
+                    <ShieldCheck className="w-3 h-3" /> Scoped to your jurisdiction: {scope}
+                  </span>
+                )}
+                {syntheticCount !== 0 && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-400/20 border border-amber-300/40 text-amber-100 text-[10px] font-bold">
+                    <AlertTriangle className="w-3 h-3" /> Includes {syntheticCount} synthetic demo students
+                  </span>
+                )}
+              </div>
+            )}
             <p className="text-blue-200 text-xs sm:text-sm mt-1 max-w-2xl leading-relaxed">
               State-level analytics platform connecting universities, technical councils, and corporate employers to eliminate regional skill disparities.
             </p>
@@ -283,6 +309,13 @@ export const GovtDashboard: React.FC = () => {
             </div>
 
             <div className="h-72 w-full">
+              {loadingGovtStats ? (
+                <div className="flex items-center justify-center h-full text-slate-400">Loading analytics...</div>
+              ) : govtStatsError ? (
+                <div className="flex items-center justify-center h-full text-red-400">Failed to load analytics</div>
+              ) : regionalStats.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-slate-400">No analytics rows yet — data appears as students engage.</div>
+              ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={regionalStats} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
@@ -302,6 +335,7 @@ export const GovtDashboard: React.FC = () => {
                   <Bar dataKey="internshipComplianceRate" name="NEP Internship Compliance %" fill="#10b981" radius={[6, 6, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
+              )}
             </div>
           </div>
         </div>
@@ -344,6 +378,9 @@ export const GovtDashboard: React.FC = () => {
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
                   Real-time monitoring of credit verification, industry internship compliance, and ABC Bank integration
+                </p>
+                <p className="text-[10px] text-amber-700 font-bold mt-1">
+                  Illustrative demo data — not live audit results.
                 </p>
               </div>
               <button
@@ -419,6 +456,13 @@ export const GovtDashboard: React.FC = () => {
               </button>
             </div>
 
+            {loadingGovtStats ? (
+              <div className="p-6 rounded-xl border border-slate-200 bg-slate-50 text-center text-xs text-slate-400">Loading analytics...</div>
+            ) : skillTrends.length === 0 ? (
+              <div className="p-6 rounded-xl border border-slate-200 bg-slate-50 text-center text-xs text-slate-500">
+                No skill-trend rows yet — trends appear as recruiters post jobs and students declare skills.
+              </div>
+            ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {skillTrends.map((trend, idx) => (
                 <div
@@ -450,6 +494,7 @@ export const GovtDashboard: React.FC = () => {
                 </div>
               ))}
             </div>
+            )}
           </div>
         </div>
       )}

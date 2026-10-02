@@ -1,12 +1,12 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { askCopilot, CopilotMessage } from '../../utils/geminiService';
+import { CopilotMessage } from '../../utils/geminiService';
+import { api } from '../../services/api';
 import { 
   Sparkles, 
   Send, 
   X, 
-  Key, 
   Cpu, 
   Bot, 
   User, 
@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 
 export const AICopilotModal: React.FC = () => {
-  const { isCopilotOpen, setIsCopilotOpen, apiKey, setApiKey, student } = useApp();
+  const { isCopilotOpen, setIsCopilotOpen, student } = useApp();
   const [messages, setMessages] = useState<CopilotMessage[]>([
     {
       id: 'm-init',
@@ -27,7 +27,6 @@ export const AICopilotModal: React.FC = () => {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [showKeyInput, setShowKeyInput] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const quickPrompts = [
@@ -65,11 +64,16 @@ export const AICopilotModal: React.FC = () => {
     setLoading(true);
 
     try {
-      const reply = await askCopilot(textToSend, apiKey);
+      // Answered server-side with the caller's real profile: Gemini when the
+      // server key is set, otherwise an honest rule-based answer from live data.
+      const reply = await api.queryCopilot(textToSend);
+      const badge = reply.source === 'gemini'
+        ? ''
+        : '\n\n_Rule-based guidance — server Gemini key not configured. Computed from your live profile, not generated._';
       const botMsg: CopilotMessage = {
         id: `bot-${Date.now()}`,
         sender: 'assistant',
-        text: reply,
+        text: reply.answer + badge,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages(prev => [...prev, botMsg]);
@@ -105,13 +109,6 @@ export const AICopilotModal: React.FC = () => {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setShowKeyInput(!showKeyInput)}
-              className="p-1.5 text-blue-200 hover:text-white hover:bg-white/10 rounded-lg transition-colors"
-              title="Optional Gemini API Key"
-            >
-              <Key className="w-4 h-4" />
-            </button>
-            <button
               onClick={() => setIsCopilotOpen(false)}
               className="p-1.5 text-blue-200 hover:text-white hover:bg-white/10 rounded-lg transition-colors"
             >
@@ -119,21 +116,6 @@ export const AICopilotModal: React.FC = () => {
             </button>
           </div>
         </div>
-
-        {/* Optional API Key banner */}
-        {showKeyInput && (
-          <div className="p-3 bg-slate-100 border-b border-slate-200 text-xs flex items-center gap-2">
-            <Key className="w-4 h-4 text-slate-500 shrink-0" />
-            <input
-              type="password"
-              placeholder="Paste Google Gemini API Key (Optional - Smart local AI active by default)"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              className="flex-1 px-2.5 py-1 text-xs rounded-lg border border-slate-300 bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-            />
-            <span className="text-[10px] text-slate-500 font-medium">Auto-saved</span>
-          </div>
-        )}
 
         {/* Messages Scroll Area */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/50">

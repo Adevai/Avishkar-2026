@@ -1,40 +1,82 @@
 import { query } from './db';
 
 /**
- * Real SQL aggregates for the platform analytics dashboards.
+ * Real SQL aggregates for the analytics dashboards.
  *
  * Every number here is computed from live tables (students, assessments,
  * applications, jobs, users) — no hardcoded/mock datasets. Field names match
  * the legacy DepartmentStat / GovtRegionStat / EmergingSkillTrend shapes so
  * the existing UI charts keep working.
+ *
+ * Viewer scoping: dashboards are person-specific.
+ *  - College (TPO) viewers pass their institution name → department stats
+ *    cover only their own students.
+ *  - Government viewers pass their jurisdiction region → regional stats
+ *    cover only that region's bucket.
+ * When no scope is passed the full-platform aggregate is returned (admin).
  */
+import { realRowsOnly } from './dataProvenance';
 
-export async function getCollegeDepartmentStats(): Promise<
+export interface ViewerScope {
+  /** College TPO: restrict department stats to this institution's students. */
+  collegeName?: string | null;
+  /** Government official: restrict regional stats to this jurisdiction bucket. */
+  jurisdiction?: string | null;
+}
+
+/** Map a free-text jurisdiction from registration to a region bucket label. */
+export function jurisdictionToRegion(jurisdiction: string | null | undefined): string | null {
+  const j = (jurisdiction || '').toLowerCase();
+  if (!j.trim()) return null;
+  if (/pune|western/.test(j)) return 'Pune Industrial & Education Belt';
+  if (/mumbai|mmr|konkan|thane/.test(j)) return 'Mumbai Metropolitan Region (MMR)';
+  if (/nagpur|vidarbha|eastern/.test(j)) return 'Nagpur & Vidarbha Tech Hub';
+  if (/marathwada|sambhajinagar|aurangabad/.test(j)) return 'Chhatrapati Sambhajinagar & Marathwada';
+  // Unknown free text: let the keyword classifier decide from the region names.
+  return j;
+}
+
+export async function getCollegeDepartmentStats(scope?: ViewerScope): Promise<
   { department: string; totalStudents: number; assessedCount: number; avgReadiness: number; placedCount: number; placementPercentage: number; topSkillGap: string }[]
 > {
   // "Placed" = has at least one Offer Extended / Interview Scheduled application;
   // readiness = students.readiness_score (0-100, set by AI assessments);
   // top gap = most-declared skill among that department's least-ready students.
+  // College viewers see ONLY their own institution's students (exact name
+  // match, falling back to a containment match for suffixed names).
+  const college = scope?.collegeName?.trim() || null;
+  const collegeFilter = college
+    ? `AND (s.college = $1 OR s.college ILIKE '%' || $1 || '%')`
+    : '';
+  const collegeFilterS2 = collegeFilter.replace(/\bs\.college\b/g, 's2.college');
+  const params = college ? [college] : [];
+
   const res = await query(
     `WITH dept AS (
         SELECT branch AS department,
                count(*)::int AS total_students,
                count(*) FILTER (WHERE assessment_completed)::int AS assessed_count,
                ROUND(AVG(NULLIF(readiness_score, 0))::numeric, 1) AS avg_readiness
-          FROM students
+          FROM students s
+         WHERE TRUE ${collegeFilter}
          GROUP BY branch
      ),
      placed AS (
         SELECT s.branch AS department, count(DISTINCT a.student_id)::int AS placed_count
           FROM applications a JOIN students s ON s.id = a.student_id
-         WHERE a.status IN ('Offer Extended', 'Interview Scheduled')
+         WHERE a.status IN ('Offer Extended', 'Interview Scheduled') ${collegeFilter}
          GROUP BY s.branch
+     ),
+     threshold AS (
+        SELECT COALESCE(PERCENTILE_CONT(0.4) WITHIN GROUP (ORDER BY readiness_score), 100) AS p40
+          FROM students s2
+         WHERE TRUE ${collegeFilterS2}
      ),
      least_ready AS (
         SELECT s.branch AS department, s.declared_skills
-          FROM students s
-        WHERE s.readiness_score > 0
-          AND s.readiness_score <= (SELECT COALESCE(PERCENTILE_CONT(0.4) WITHIN GROUP (ORDER BY readiness_score), 100) FROM students)
+          FROM students s, threshold t
+         WHERE s.readiness_score > 0 ${collegeFilter}
+           AND s.readiness_score <= t.p40
      ),
      gaps AS (
         SELECT department, skill, count(*) AS n
@@ -55,7 +97,8 @@ export async function getCollegeDepartmentStats(): Promise<
        FROM dept d
        LEFT JOIN placed p ON p.department = d.department
        LEFT JOIN top_gap t ON t.department = d.department
-      ORDER BY d.total_students DESC`
+      ORDER BY d.total_students DESC`,
+    params
   );
   return res.rows.map(r => ({
     department: r.department,
@@ -68,12 +111,21 @@ export async function getCollegeDepartmentStats(): Promise<
   }));
 }
 
-export async function getGovtRegionalStats(): Promise<
+export async function getGovtRegionalStats(scope?: ViewerScope): Promise<
   { region: string; collegesCount: number; totalStudents: number; avgEmployabilityScore: number; internshipComplianceRate: number; tierDistribution: { tier1: number; tier2: number; tier3: number } }[]
 > {
   // Regions derive from each student's college name via keyword buckets
   // (no colleges table exists); readiness proxies employability; the
   // internship compliance rate = share of students with >=1 application.
+  // Government viewers see ONLY their jurisdiction's bucket.
+  const region = scope?.jurisdiction ? jurisdictionToRegion(scope.jurisdiction) : null;
+  const params: any[] = [];
+  let regionFilter = '';
+  if (region) {
+    params.push(region);
+    regionFilter = `AND c.region = $1`;
+  }
+
   const res = await query(
     `WITH classified AS (
         SELECT s.id,
@@ -96,10 +148,11 @@ export async function getGovtRegionalStats(): Promise<
      applied AS (
         SELECT c.region, count(DISTINCT a.student_id)::int AS n
           FROM applications a JOIN classified c ON c.id = a.student_id
+         WHERE TRUE ${regionFilter}
          GROUP BY c.region
      ),
      totals AS (
-        SELECT region, count(*)::int AS n FROM classified GROUP BY region
+        SELECT c.region, count(*)::int AS n FROM classified c WHERE TRUE ${regionFilter} GROUP BY c.region
      )
      SELECT c.region,
             COALESCE(t.colleges_count, 0) AS colleges_count,
@@ -113,8 +166,10 @@ export async function getGovtRegionalStats(): Promise<
        LEFT JOIN tiers t ON t.region = c.region
        LEFT JOIN totals tot ON tot.region = c.region
        LEFT JOIN applied ap ON ap.region = c.region
+      WHERE TRUE ${regionFilter}
       GROUP BY c.region, t.colleges_count, tot.n, ap.n
-      ORDER BY total_students DESC`
+      ORDER BY total_students DESC`,
+    params
   );
   return res.rows.map(r => ({
     region: r.region,
@@ -137,7 +192,7 @@ export async function getEmergingSkillTrends(): Promise<
         SELECT skill, count(DISTINCT j.id)::int AS jobs
           FROM jobs j, jsonb_array_elements(j.required_skills) AS rs,
                LATERAL (SELECT rs->>'name' AS skill) s
-         WHERE j.status = 'open'
+         WHERE j.status = 'open' AND ${realRowsOnly('j')}
          GROUP BY skill
      ),
      total_open AS (SELECT count(*)::int AS n FROM jobs WHERE status = 'open'),

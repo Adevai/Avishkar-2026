@@ -179,6 +179,9 @@ export const CollegeAutocomplete: React.FC<CollegeAutocompleteProps> = ({
             <span>Live Registry Matches ({results.length})</span>
             {isLoading && <span className="text-blue-600 flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" /> Querying national APIs...</span>}
           </div>
+          <div className="px-3.5 py-1.5 bg-slate-50/60 border-b border-slate-100 text-[10px] text-slate-400 leading-snug">
+            Curated verified registry + live public registries (autocomplete only). Account verification uses the curated registry.
+          </div>
 
           {/* Results List */}
           {results.length > 0 ? (

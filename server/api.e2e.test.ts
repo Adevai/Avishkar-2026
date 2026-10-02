@@ -17,6 +17,11 @@ vi.spyOn(console, 'warn').mockImplementation(() => {});
 
 process.env.NODE_ENV = 'test';
 process.env.START_SERVER = 'false';
+// SMTP must fail INSTANTLY in tests (refused connection) so OTP flows exercise
+// the dev-fallback path without per-call upstream round-trips (real SMTP creds
+// in .env would add ~1s of Gmail 535 latency per OTP send and blow timeouts).
+process.env.SMTP_HOST = '127.0.0.1';
+process.env.SMTP_PORT = '1';
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret-e2e-0123456789abcdef';
 
 // Import AFTER env vars are set
@@ -31,7 +36,18 @@ beforeAll(async () => {
     dbAvailable = true;
     // Run the REAL production schema init (idempotent: CREATE TABLE IF NOT EXISTS
     // + ALTER ADD COLUMN IF NOT EXISTS) so tests exercise the same shape as prod.
-    await initDatabase();
+    // initDatabase runs DDL concurrently with the dev server/other suites and can
+    // hit transient Postgres deadlocks — retry a few times before giving up.
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await initDatabase();
+        break;
+      } catch (e: any) {
+        if (attempt === 4 || !/deadlock|could not serialize/i.test(String(e?.message))) throw e;
+        console.warn(`[e2e] initDatabase deadlock (attempt ${attempt}/4), retrying...`);
+        await new Promise(r => setTimeout(r, 800 * attempt));
+      }
+    }
     // Ensure deterministic schema bits the tests touch
     await pool.query(`
       CREATE TABLE IF NOT EXISTS verification_reviews (
@@ -2046,5 +2062,192 @@ describe('Recruiter funnel (GET /recruiter/funnel)', () => {
     // The other recruiter's funnel must not include these postings
     const theirs = await request(app).get('/api/recruiter/funnel').set('Authorization', `Bearer ${otherToken}`);
     expect(theirs.body.postings.some((p: any) => jobIds.includes(p.jobId))).toBe(false);
+  });
+});
+
+// ── AI HONESTY & VIEWER SCOPING (personalised copilot / scoped analytics / randomized assessments) ──
+describe('AI honesty & viewer-scoped surfaces', () => {
+  const stamp = Date.now();
+  const stuEmail = `e2e-ai-stu-${stamp}@spark-inst.test`;
+  const colEmail = `e2e-ai-col-${stamp}@spark-inst.test`;
+  const col2Email = `e2e-ai-col2-${stamp}@spark-inst.test`;
+  const govtEmail = `e2e-ai-govt-${stamp}@gov.test`;
+  let stuToken = '', colToken = '', col2Token = '', govtToken = '';
+  let keyBefore: string | undefined;
+  const COLLEGE = 'E2E Scoped Institute of Technology';
+  const COLLEGE2 = 'E2E Other Institute';
+  const JURISDICTION = 'Pune Western Regional Directorate';
+
+  const register = async (payload: Record<string, any>): Promise<string> => {
+    const email = String(payload.email);
+    await request(app).post('/api/auth/register-send-otp').send({ email, name: payload.name });
+    const otpRow = await pool.query(
+      'SELECT otp FROM otp_verifications WHERE LOWER(email) = $1 ORDER BY created_at DESC LIMIT 1', [email]);
+    if (!otpRow.rows[0]?.otp) throw new Error('OTP dispatch failed for ' + email);
+    await request(app).post('/api/auth/register-verify-otp').send({ email, otp: otpRow.rows[0].otp });
+    const reg = await request(app).post('/api/register').send(payload);
+    if (reg.status !== 200) throw new Error(`register ${email}: ${reg.status} ${JSON.stringify(reg.body)}`);
+    const login = await request(app).post('/api/login').send({ email, password: payload.password });
+    return login.body.token as string;
+  };
+
+  beforeAll(async () => {
+    if (!dbAvailable) return;
+    const { __resetAuthRateBucketsForTests } = await import('./index');
+    const { __resetRateLimitsForTests } = await import('./rateLimit');
+    __resetAuthRateBucketsForTests();
+    __resetRateLimitsForTests();
+    keyBefore = process.env.GEMINI_API_KEY;
+    delete process.env.GEMINI_API_KEY; // force the honest fallback paths
+
+    stuToken = await register({
+      role: 'student', name: 'E2E AI Student', email: stuEmail, password: 'AiStu@2026',
+      college: COLLEGE, degree: 'B.Tech', branch: 'CSE', semester: 5, cgpa: 8.0,
+      targetRole: 'Full Stack Cloud Engineer',
+    });
+    colToken = await register({
+      role: 'college', name: 'E2E AI TPO', email: colEmail, password: 'AiTpo@2026',
+      department: COLLEGE, aisheCode: 'C-88001', officialDomain: 'spark-inst.test',
+    });
+    col2Token = await register({
+      role: 'college', name: 'E2E AI TPO Two', email: col2Email, password: 'AiTpo@2026',
+      department: COLLEGE2, aisheCode: 'C-88002', officialDomain: 'spark-inst.test',
+    });
+    govtToken = await register({
+      role: 'government', name: 'E2E AI Official', email: govtEmail, password: 'AiGov@2026',
+      department: 'Higher Education Council', jurisdiction: JURISDICTION,
+    });
+
+    // Real profile for the copilot/match engine
+    await pool.query(
+      `UPDATE students SET declared_skills = $1::jsonb, readiness_score = 78, target_role = 'Full Stack Cloud Engineer'
+        WHERE LOWER(email) = $2`,
+      [JSON.stringify([{ name: 'React.js' }, { name: 'Node.js' }, { name: 'Python' }]), stuEmail]
+    );
+    // Open jobs the match engine can score against
+    for (const [suffix, title, skill] of [['b', 'E2E Scoped Backend Role', 'Node.js'], ['f', 'E2E Scoped Frontend Role', 'React.js']] as const) {
+      await pool.query(
+        `INSERT INTO jobs (id, title, company, location, type, stipend_or_salary, description, required_skills, eligible_branches, posted_by, status)
+         VALUES ($1, $2, 'E2E Scoped Corp', 'Pune', 'Internship', '₹15k', 'E2E scoped job', $3::jsonb, '[]'::jsonb, 'usr-e2e-recruit-ai', 'open')
+         ON CONFLICT (id) DO NOTHING`,
+        [`job-e2e-ai-${stamp}-${suffix}`, title,
+         JSON.stringify([{ name: skill, weight: 1 }, { name: 'Docker', weight: 1 }])]
+      );
+    }
+    // A student at the second college — must never leak into the first TPO's view
+    await pool.query(
+      `INSERT INTO students (id, user_id, name, email, college, degree, branch, semester, cgpa, graduation_year, target_role, readiness_score, declared_skills)
+       VALUES ('std-e2e-ai-other', NULL, 'E2E AI Other Student', $1, $2, 'B.Tech', 'IT', 3, 7.0, 2027, 'Data Engineer', 40, '[{"name":"Go"}]'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [`e2e-ai-other-${stamp}@spark-inst.test`, COLLEGE2]
+    );
+  });
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    if (keyBefore === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = keyBefore;
+    for (const e of [stuEmail, colEmail, col2Email, govtEmail]) {
+      await pool.query(`DELETE FROM otp_verifications WHERE LOWER(email) = $1`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM notifications WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM students WHERE LOWER(email) = $1 OR LOWER(email) LIKE 'e2e-ai-other-%'`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM institutions WHERE user_id IN (SELECT id FROM users WHERE LOWER(email) = $1)`, [e]).catch(() => {});
+      await pool.query(`DELETE FROM users WHERE LOWER(email) = $1`, [e]).catch(() => {});
+    }
+    await pool.query(`DELETE FROM jobs WHERE id LIKE 'job-e2e-ai-${stamp}-%'`).catch(() => {});
+    await pool.query(`DELETE FROM students WHERE id = 'std-e2e-ai-other'`).catch(() => {});
+  });
+
+  dbIt('/analytics: college TPO sees only own institution; government only its region', async () => {
+    const mine = await request(app).get('/api/analytics').set('Authorization', `Bearer ${colToken}`);
+    expect(mine.status).toBe(200);
+    expect(mine.body.scope.collegeName).toBe(COLLEGE);
+    expect(mine.body.synthetic).toHaveProperty('students');
+
+    // Every department row the TPO sees must belong to its OWN institution
+    const depts = mine.body.collegeDepartmentStats || [];
+    for (const d of depts) {
+      const foreign = await pool.query(
+        `SELECT count(*)::int AS n FROM students
+          WHERE branch = $1 AND college ILIKE '%' || $2 || '%' AND lower(college) <> lower($2)`,
+        [d.department, COLLEGE]);
+      expect(foreign.rows[0].n).toBe(0);
+    }
+    // The seeded other-college student must NOT be counted in the TPO's view
+    const otherPresent = await pool.query(
+      `SELECT count(*)::int AS n FROM students WHERE id = 'std-e2e-ai-other'`);
+    expect(otherPresent.rows[0].n).toBe(1);
+    const scopedNames = await pool.query(
+      `SELECT DISTINCT college FROM students WHERE college ILIKE '%' || $1 || '%'`, [COLLEGE]);
+    expect(scopedNames.rows.length).toBe(1);
+
+    // A second college's TPO sees its own view, not the first one's students
+    const mine2 = await request(app).get('/api/analytics').set('Authorization', `Bearer ${col2Token}`);
+    expect(mine2.status).toBe(200);
+    expect(mine2.body.scope.collegeName).toBe(COLLEGE2);
+    for (const d of (mine2.body.collegeDepartmentStats || [])) {
+      const foreign = await pool.query(
+        `SELECT count(*)::int AS n FROM students WHERE branch = $1 AND college ILIKE '%' || $2 || '%' AND lower(college) <> lower($2)`,
+        [d.department, COLLEGE2]);
+      expect(foreign.rows[0].n).toBe(0);
+    }
+
+    // Government viewer: only jurisdiction-bucket regions
+    const govt = await request(app).get('/api/analytics').set('Authorization', `Bearer ${govtToken}`);
+    expect(govt.status).toBe(200);
+    expect(govt.body.scope.jurisdiction).toBe(JURISDICTION);
+    for (const r of (govt.body.govtRegionalStats || [])) {
+      expect(r.region).toBe('Pune Industrial & Education Belt');
+    }
+  });
+
+  dbIt('/copilot without Gemini key: honest rule-based answer personalised from the live profile', async () => {
+    const res = await request(app).post('/api/copilot')
+      .set('Authorization', `Bearer ${stuToken}`)
+      .send({ query: 'What should I focus on next?' });
+    expect(res.status).toBe(200);
+    expect(res.body.source).toBe('rule-based');
+    expect(res.body.personalised).toBe(true);
+    expect(res.body.answer).toContain('78/100');
+    expect(res.body.answer).toContain('Rule-based guidance');
+
+    // Anonymous callers get honest but non-personal guidance
+    const anon = await request(app).post('/api/copilot').send({ query: 'What should I focus on next?' });
+    expect(anon.status).toBe(200);
+    expect(anon.body.source).toBe('rule-based');
+    expect(anon.body.personalised).toBe(false);
+  });
+
+  dbIt('/assessment/generate without key: randomized papers, per-session grading, no two runs identical', async () => {
+    const a = await request(app).post('/api/assessment/generate').send({ role: 'Full Stack Cloud Engineer' });
+    expect(a.status).toBe(200);
+    expect(a.body.generatedBy).toBe('randomized-bank');
+    expect(a.body.questions).toHaveLength(15);
+    expect(a.body.assessmentId).toMatch(/^assessment-static-/);
+
+    // Personalised variant via the caller's declared skills
+    const b = await request(app).post('/api/assessment/generate')
+      .set('Authorization', `Bearer ${stuToken}`)
+      .send({ role: 'Full Stack Cloud Engineer' });
+    expect(b.status).toBe(200);
+    expect(b.body.personalised).toBe(true);
+    expect(b.body.questions).toHaveLength(15);
+
+    // Genuine randomness: the same question's option order differs across runs
+    const qa = a.body.questions[0];
+    const qb = b.body.questions.find((q: any) => q.question === qa.question);
+    expect(qb).toBeTruthy();
+    expect(qb.options.join('|')).not.toBe(qa.options.join('|'));
+
+    // Grading works against the generated session, not the static bank
+    const grade = await request(app).post('/api/assessment/grade').send({
+      assessmentId: b.body.assessmentId,
+      answers: Object.fromEntries(b.body.questions.map((q: any, i: number) => [`q-${i}`, 0])),
+      timeSpentSeconds: 300,
+    });
+    expect(grade.status).toBe(200);
+    expect(grade.body.success).toBe(true);
+    expect(grade.body.result.percentage).toBeGreaterThanOrEqual(0);
+    expect(grade.body.result.maxScore).toBe(15);
   });
 });

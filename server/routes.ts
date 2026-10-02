@@ -12,6 +12,7 @@ import { askCopilot } from '../src/utils/geminiService';
 import { extractSkillsFromText } from './nlpEngine';
 import { sendOtpEmail, sendRegistrationOtpEmail, sendPasswordResetSuccessEmail, sendSecurityAlertEmail, buildInterviewIcs, sendInterviewConfirmationEmail } from './emailService';
 import { getCollegeDepartmentStats, getGovtRegionalStats, getEmergingSkillTrends } from './analytics';
+import { getSyntheticCounts } from './dataProvenance';
 import { icsEscape as icsEscapeText, icsBasicUtc as icsBasicUtcTime } from './emailService';
 import { checkRateLimit, clientIpOf } from './rateLimit';
 import { enqueueEmail } from './emailOutbox';
@@ -43,6 +44,26 @@ export const router = Router();
 // In-memory store for active assessments (for grading). In production, use Redis or Postgres.
 const activeAssessments = new Map<string, any>();
 
+// Build a fresh paper from the static bank with genuine randomness: sample
+// questions, shuffle options, remap the answer index. Every run differs.
+function buildRandomizedFallbackPaper(skills: string[]): { paper: any[]; seededFrom: string[] } {
+  const bank = ASSESSMENT_QUESTIONS.map(q => ({ ...q }));
+  for (let i = bank.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [bank[i], bank[j]] = [bank[j], bank[i]];
+  }
+  const paper = bank.slice(0, Math.min(15, bank.length)).map(q => {
+    const correctText = q.options[q.correctAnswer];
+    const options = [...q.options];
+    for (let i = options.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [options[i], options[j]] = [options[j], options[i]];
+    }
+    return { ...q, options, correctAnswer: options.indexOf(correctText) };
+  });
+  return { paper, seededFrom: skills.slice(0, 5) };
+}
+
 router.post('/assessment/generate', async (req: Request, res: Response) => {
   const { role } = req.body;
   if (!role) return res.status(400).json({ error: 'Role is required' });
@@ -53,15 +74,42 @@ router.post('/assessment/generate', async (req: Request, res: Response) => {
     return res.status(429).json({ error: 'Assessment generation limit reached. Try again shortly.' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
+  // Personalise the paper: the caller's declared skills and target role shape
+  // the prompt (Gemini path) — and when Gemini is unavailable the fallback is
+  // still randomized (sampled + option-shuffled) rather than the fixed bank.
+  let declaredSkills: string[] = [];
+  let readiness: number | null = null;
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (token) {
+    try {
+      const decoded: any = jwt.verify(token, process.env.JWT_SECRET || 'spark-dev-secret');
+      const stu = await query(
+        `SELECT declared_skills, readiness_score FROM students WHERE user_id = $1 LIMIT 1`,
+        [decoded.sub]
+      );
+      const ds = stu.rows[0]?.declared_skills;
+      if (Array.isArray(ds)) {
+        declaredSkills = ds.map((s: any) => (typeof s === 'object' ? s?.name : String(s))).filter(Boolean).slice(0, 8);
+      }
+      readiness = stu.rows[0]?.readiness_score ?? null;
+    } catch { /* anonymous generation */ }
   }
 
-  try {
-    const prompt = `
+  const apiKey = process.env.GEMINI_API_KEY;
+  const skillLine = declaredSkills.length
+    ? `The candidate declares these skills (probe their real depth, include 4-5 questions that specifically stress these): ${declaredSkills.join(', ')}.`
+    : '';
+  const readinessLine = readiness ? `Current readiness score: ${readiness}/100 — pitch difficulty just above it.` : '';
+
+  if (apiKey) {
+    try {
+      const prompt = `
       Generate 15 multiple-choice assessment questions for a ${role}.
+      ${skillLine}
+      ${readinessLine}
       Make them difficult, covering Fundamentals, Backend Systems, Frontend Web, Cloud & DevOps, AI & Data, and Soft Skills.
+      Randomize topic emphasis and scenario details so two candidates for the same role never receive identical papers.
       Return ONLY a valid JSON array where each object has:
       {
         "category": "category_name",
@@ -74,47 +122,65 @@ router.post('/assessment/generate', async (req: Request, res: Response) => {
       }
     `;
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" }
-      })
-    });
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json", temperature: 1.0 }
+        })
+      });
 
-    if (!response.ok) throw new Error('Gemini API call failed');
-    const data: any = await response.json();
-    const rawText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    
-    if (!rawText) throw new Error('Empty response from Gemini');
-    
-    const questions = JSON.parse(rawText);
-    const assessmentId = `assessment-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    
-    // Store securely on backend for grading (bounded so abandoned sessions
-    // can't grow the map without limit)
-    activeAssessments.set(assessmentId, questions);
-    if (activeAssessments.size > 500) {
-      const oldest = activeAssessments.keys().next().value as string | undefined;
-      if (oldest) activeAssessments.delete(oldest);
+      if (!response.ok) throw new Error('Gemini API call failed');
+      const data: any = await response.json();
+      const rawText: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!rawText) throw new Error('Empty response from Gemini');
+
+      const questions = JSON.parse(rawText);
+      const assessmentId = `assessment-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+
+      // Store securely on backend for grading (bounded so abandoned sessions
+      // can't grow the map without limit)
+      activeAssessments.set(assessmentId, questions);
+      if (activeAssessments.size > 500) {
+        const oldest = activeAssessments.keys().next().value as string | undefined;
+        if (oldest) activeAssessments.delete(oldest);
+      }
+
+      // Strip correct answers before sending to frontend
+      const clientQuestions = questions.map((q: any, i: number) => ({
+        id: `q-${i}`,
+        category: q.category,
+        categoryName: q.categoryName,
+        question: q.question,
+        options: q.options,
+        difficulty: q.difficulty
+      }));
+
+      return res.json({ success: true, assessmentId, questions: clientQuestions, generatedBy: 'gemini', personalised: declaredSkills.length > 0 });
+    } catch (error: any) {
+      console.error('AI generation failed, using randomized static paper:', error.message);
     }
-    
-    // Strip correct answers before sending to frontend
-    const clientQuestions = questions.map((q: any, i: number) => ({
-      id: `q-${i}`,
-      category: q.category,
-      categoryName: q.categoryName,
-      question: q.question,
-      options: q.options,
-      difficulty: q.difficulty
-    }));
-
-    res.json({ success: true, assessmentId, questions: clientQuestions });
-  } catch (error: any) {
-    console.error('Failed to generate assessment:', error);
-    res.status(500).json({ error: 'Failed to generate assessment' });
   }
+
+  // No key or upstream failure: randomized paper from the static bank.
+  const { paper } = buildRandomizedFallbackPaper(declaredSkills);
+  const assessmentId = `assessment-static-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+  activeAssessments.set(assessmentId, paper);
+  if (activeAssessments.size > 500) {
+    const oldest = activeAssessments.keys().next().value as string | undefined;
+    if (oldest) activeAssessments.delete(oldest);
+  }
+  const clientQuestions = paper.map((q: any, i: number) => ({
+    id: `q-${i}`,
+    category: q.category,
+    categoryName: q.categoryName,
+    question: q.question,
+    options: q.options,
+    difficulty: q.difficulty,
+  }));
+  res.json({ success: true, assessmentId, questions: clientQuestions, generatedBy: 'randomized-bank', personalised: declaredSkills.length > 0 });
 });
 
 router.post('/assessment/grade', async (req: Request, res: Response) => {
@@ -2842,13 +2908,29 @@ router.post('/interview-reminders/run', async (req: Request, res: Response) => {
 router.get('/analytics', async (req: Request, res: Response) => {
   // Real aggregates from live tables — every figure on the analytics
   // dashboards is computed from students/assessments/applications/jobs.
+  // Viewer-scoped: college TPOs see their own institution's department
+  // stats; government officials see their jurisdiction's region. Anonymous
+  // callers (no/invalid token) get the platform-wide aggregate.
   try {
-    const [collegeDepartmentStats, govtRegionalStats, emergingSkillTrends] = await Promise.all([
-      getCollegeDepartmentStats(),
-      getGovtRegionalStats(),
+    let scope: { collegeName?: string | null; jurisdiction?: string | null } = {};
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : (req.query.token as string) || '';
+    if (token) {
+      try {
+        const decoded: any = jwt.verify(token, process.env.JWT_SECRET || 'spark-dev-secret');
+        const me = await query(`SELECT role, department, jurisdiction FROM users WHERE id = $1`, [decoded.sub]);
+        const row = me.rows[0];
+        if (row?.role === 'college') scope.collegeName = row.department || null;
+        if (row?.role === 'government') scope.jurisdiction = row.jurisdiction || null;
+      } catch { /* anonymous scope */ }
+    }
+    const [collegeDepartmentStats, govtRegionalStats, emergingSkillTrends, synthetic] = await Promise.all([
+      getCollegeDepartmentStats(scope),
+      getGovtRegionalStats(scope),
       getEmergingSkillTrends(),
+      getSyntheticCounts(),
     ]);
-    res.json({ collegeDepartmentStats, govtRegionalStats, emergingSkillTrends });
+    res.json({ collegeDepartmentStats, govtRegionalStats, emergingSkillTrends, scope, synthetic });
   } catch (error: any) {
     console.error('GET /analytics failed:', error.message);
     res.status(500).json({ error: 'Failed to compute analytics.' });
@@ -2863,12 +2945,96 @@ router.post('/copilot', async (req: Request, res: Response) => {
   if (!rl.allowed) {
     return res.status(429).json({ error: 'Copilot rate limit reached. Try again shortly.' });
   }
-  try {
-    const answer = await askCopilot(userQuery || '', process.env.GEMINI_API_KEY);
-    res.json({ answer });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
+
+  // Personalise: pull the caller's real profile (skills, readiness) and their
+  // top matched OPEN jobs so the model answers about THIS student, not a
+  // generic persona. Anonymous callers get the general copilot.
+  let ctx: {
+    name?: string; role?: string; readiness?: number;
+    verifiedSkills?: string[]; declaredSkills?: string[];
+    topMatches?: { title: string; company: string; matchPct: number; missing: string[] }[];
+  } = {};
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (token) {
+    try {
+      const decoded: any = jwt.verify(token, process.env.JWT_SECRET || 'spark-dev-secret');
+      const stu = await query(
+        `SELECT name, target_role, readiness_score, declared_skills, verified_skills
+           FROM students WHERE user_id = $1 LIMIT 1`,
+        [decoded.sub]
+      );
+      const s = stu.rows[0];
+      if (s) {
+        const toName = (x: any) => (typeof x === 'object' ? x?.name : String(x)).trim();
+        const verified: string[] = (s.verified_skills || []).map((v: any) => toName(v)).filter(Boolean);
+        const declared: string[] = (s.declared_skills || []).map(toName).filter(Boolean);
+        const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const skillSet = new Set([...verified, ...declared].map(norm));
+        const jobs = await query(`SELECT id, title, company, required_skills FROM jobs WHERE status = 'open' LIMIT 120`);
+        const scored = jobs.rows.map((j: any) => {
+          const reqs: { name: string; weight: number }[] = (j.required_skills || []).map((r: any) =>
+            typeof r === 'object' ? { name: r.name, weight: r.weight || 1 } : { name: String(r), weight: 1 }
+          );
+          let earned = 0, weight = 0;
+          const missing: string[] = [];
+          for (const r of reqs) {
+            weight += r.weight;
+            if ([...skillSet].some(k => k.includes(norm(r.name)) || norm(r.name).includes(k))) earned += r.weight;
+            else missing.push(r.name);
+          }
+          return { title: j.title, company: j.company, matchPct: weight ? Math.round((earned / weight) * 100) : 0, missing: missing.slice(0, 4) };
+        }).sort((a: any, b: any) => b.matchPct - a.matchPct).slice(0, 3);
+        ctx = {
+          name: s.name,
+          role: s.target_role || undefined,
+          readiness: s.readiness_score || 0,
+          verifiedSkills: verified.slice(0, 10),
+          declaredSkills: declared.slice(0, 10),
+          topMatches: scored,
+        };
+      }
+    } catch { /* anonymous */ }
   }
+
+  const ctxBlock = ctx.name ? `
+STUDENT CONTEXT (use these real numbers, never invent others):
+- Name: ${ctx.name}; Target role: ${ctx.role || 'not set'}; Readiness: ${ctx.readiness ?? 'n/a'}/100
+- Verified skills: ${ctx.verifiedSkills?.join(', ') || 'none yet'}
+- Declared skills: ${ctx.declaredSkills?.join(', ') || 'none yet'}
+- Top matched open jobs: ${ctx.topMatches?.map(m => `${m.title} @ ${m.company} (${m.matchPct}% match${m.missing.length ? `, missing: ${m.missing.join('/')}` : ''})`).join('; ') || 'none yet'}
+` : '';
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (apiKey) {
+    try {
+      const answer = await askCopilot(`${ctxBlock}
+User Question: ${userQuery || ''}`, apiKey);
+      return res.json({ answer, personalised: !!ctx.name, source: 'gemini' });
+    } catch (error: any) {
+      console.error('Copilot Gemini call failed:', error.message);
+      // fall through to the rule-based guidance below
+    }
+  }
+
+  // No Gemini key (or upstream failure): an honest rule-based answer built
+  // from the student's REAL data — no fabricated scores or canned advice.
+  const lines: string[] = [];
+  lines.push(`**Rule-based guidance** (AI generation needs GEMINI_API_KEY on the server) — computed from your live profile:`);
+  if (ctx.name) {
+    lines.push(`• Readiness: **${ctx.readiness ?? 0}/100** for **${ctx.role || 'your target role'}**.`);
+    const gapTargets = (ctx.topMatches || []).flatMap(m => m.missing).filter(Boolean);
+    const uniqueGaps = [...new Set(gapTargets)].slice(0, 4);
+    lines.push(uniqueGaps.length
+      ? `• Your highest-priority gaps vs live postings: **${uniqueGaps.join(', ')}**.`
+      : `• No critical gaps detected against the current open postings in your top matches.`);
+    lines.push(`• Strongest matches right now: ${(ctx.topMatches || []).map(m => `${m.title} @ ${m.company} (${m.matchPct}%)`).join('; ') || 'post-match jobs will appear here'}.`);
+    lines.push(`• Next step: complete/retake the AI Skill Assessment — verified scores (not declared ones) drive match quality and recruiter trust.`);
+  } else {
+    lines.push(`• Sign in as a student for guidance computed from your own skills, readiness score and live job matches.`);
+    lines.push(`• Meanwhile: open postings and their required skills are listed under Opportunity Matching — match quality improves once your skills are verified.`);
+  }
+  return res.json({ answer: lines.join('\n'), personalised: !!ctx.name, source: 'rule-based' });
 });
 
 // ── TalentSearch: real direct interview invitation (persisted + notified) ───
@@ -2936,6 +3102,7 @@ router.get('/college/nirf-export', requireAuth, async (req: Request, res: Respon
 // 11. REGISTRATION & ONBOARDING (WITH EMAIL OTP)
 // ==========================================
 router.post('/auth/register-send-otp', async (req: Request, res: Response) => {
+  console.log('--- OTP ENDPOINT HIT ---', req.body);
   const { email, name } = req.body;
   if (!email || typeof email !== 'string' || !email.includes('@')) {
     return res.status(400).json({ error: 'Please provide a valid email address.' });
@@ -3206,14 +3373,18 @@ router.post('/register', async (req: Request, res: Response) => {
         }
 
         const userRes = await client.query(
-          `INSERT INTO users (id, name, email, role, avatar, password_hash, verification_status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `INSERT INTO users (id, name, email, role, avatar, password_hash, verification_status, department, jurisdiction)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, role = EXCLUDED.role,
              avatar = EXCLUDED.avatar,
              password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash),
-             verification_status = EXCLUDED.verification_status
+             verification_status = EXCLUDED.verification_status,
+             department = COALESCE(EXCLUDED.department, users.department),
+             jurisdiction = COALESCE(EXCLUDED.jurisdiction, users.jurisdiction)
            RETURNING *`,
-          [userId, name.trim(), normalizedEmail, role || 'student', avatar, passwordHash, verificationStatus]
+          [userId, name.trim(), normalizedEmail, role || 'student', avatar, passwordHash, verificationStatus,
+           (role === 'college' && department) ? String(department).slice(0, 128) : null,
+           (role === 'government' && jurisdiction) ? String(jurisdiction).slice(0, 128) : null]
         );
 
       // The row's real id (on re-registration the existing id is preserved)

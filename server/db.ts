@@ -380,6 +380,9 @@ export async function initDatabase() {
     // ── Production hardening & product expansion (idempotent) ──
     // Token revocation: bump to invalidate all existing JWTs for a user.
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 0;`);
+    // Viewer-scope fields for role dashboards (college TPO department, govt jurisdiction).
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(128);`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS jurisdiction VARCHAR(128);`);
     // Per-student secret token for the read-only calendar subscription feed.
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cal_feed_token VARCHAR(64);`);
     await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cal_token ON users(cal_feed_token) WHERE cal_feed_token IS NOT NULL;`);

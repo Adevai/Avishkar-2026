@@ -41,6 +41,8 @@ export const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   const [resendCooldown, setResendCooldown] = useState(0);
+  // Dev fallback code (server SMTP-unavailable response, non-production only)
+  const [devOtp, setDevOtp] = useState<string | null>(null);
 
   // Sync initial email when modal opens
   useEffect(() => {
@@ -83,7 +85,10 @@ export const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({
     setIsLoading(true);
     try {
       const res = await api.requestPasswordResetOtp(email.trim());
-      setSuccessMessage(res.message || `Verification code sent to ${email.trim()}!`);
+      setDevOtp(res.devOtp || null);
+      setSuccessMessage(res.devOtp
+        ? 'Email delivery unavailable (dev SMTP fallback) — your code is shown below.'
+        : (res.message || `Verification code sent to ${email.trim()}!`));
       setResendCooldown(60);
       setStep(2);
     } catch (err: any) {
@@ -285,6 +290,15 @@ export const ForgotPasswordModal: React.FC<ForgotPasswordModalProps> = ({
                     placeholder="••••••"
                   />
                 </div>
+                {devOtp && (
+                  <button
+                    type="button"
+                    onClick={() => setOtp(devOtp)}
+                    className="mt-2 w-full px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 text-[11px] font-bold text-left transition-colors"
+                  >
+                    Dev mode (email delivery unavailable): your code is {devOtp} — tap to fill
+                  </button>
+                )}
               </div>
 
               <div className="flex items-center justify-between text-xs pt-1">

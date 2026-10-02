@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext';
-import { COLLEGE_DEPARTMENT_STATS } from '../../data/mockData';
 import { api } from '../../services/api';
 import {
   Building2,
@@ -37,14 +36,29 @@ import {
 export const CollegeDashboard: React.FC = () => {
   const { mous, activeTab, setActiveTab, setNotification } = useApp();
   const [driveFilter, setDriveFilter] = useState<'all' | 'ongoing' | 'upcoming'>('all');
-  const [stats, setStats] = useState<any[]>(COLLEGE_DEPARTMENT_STATS);
+  const [stats, setStats] = useState<any[]>([]);
+  const [loadingStats, setLoadingStats] = useState(true);
+  const [statsError, setStatsError] = useState(false);
+  const [syntheticCount, setSyntheticCount] = useState(0);
+  const [scope, setScope] = useState('');
 
+  // Real analytics only: whatever the API returns is shown verbatim —
+  // including an empty list. No silent mock fallback, ever.
   useEffect(() => {
+    let alive = true;
     api.getAnalytics().then(res => {
-      if (res.collegeDepartmentStats && res.collegeDepartmentStats.length > 0) {
-        setStats(res.collegeDepartmentStats);
-      }
-    }).catch(console.error);
+      if (!alive) return;
+      setStats(res.collegeDepartmentStats || []);
+      setSyntheticCount(res.synthetic?.students || 0);
+      setScope(res.scope?.collegeName || '');
+      setLoadingStats(false);
+    }).catch(err => {
+      console.error(err);
+      if (!alive) return;
+      setStatsError(true);
+      setLoadingStats(false);
+    });
+    return () => { alive = false; };
   }, []);
 
   const handleExportReport = () => {
@@ -233,6 +247,20 @@ export const CollegeDashboard: React.FC = () => {
                 <p className="text-xs text-slate-500">
                   Correlating AI-verified competency levels with corporate placement conversion
                 </p>
+                {(scope || syntheticCount !== 0) && (
+                  <div className="flex flex-wrap items-center gap-2 mt-2">
+                    {scope && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 border border-blue-200 text-blue-700 text-[10px] font-bold">
+                        <Building2 className="w-3 h-3" /> Scoped to your institution: {scope}
+                      </span>
+                    )}
+                    {syntheticCount !== 0 && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-700 text-[10px] font-bold">
+                        <AlertCircle className="w-3 h-3" /> Includes {syntheticCount} synthetic demo students
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <button
                 onClick={() => setActiveTab('dept-analysis')}
@@ -244,7 +272,14 @@ export const CollegeDashboard: React.FC = () => {
             </div>
 
             <div className="h-72 w-full">
-              <ResponsiveContainer width="100%" height="100%">
+              {loadingStats ? (
+                <div className="flex items-center justify-center h-full text-slate-400">Loading analytics...</div>
+              ) : statsError ? (
+                <div className="flex items-center justify-center h-full text-red-400">Failed to load analytics</div>
+              ) : stats.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-slate-400">No analytics rows yet — data appears as students engage.</div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={stats} margin={{ top: 20, right: 30, left: 0, bottom: 20 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                   <XAxis dataKey="department" tick={{ fontSize: 10, fill: '#64748b' }} interval={0} />
@@ -263,6 +298,7 @@ export const CollegeDashboard: React.FC = () => {
                   <Bar dataKey="placementPercentage" name="Placement Conversion %" fill="#10b981" radius={[6, 6, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
+              )}
             </div>
           </div>
 

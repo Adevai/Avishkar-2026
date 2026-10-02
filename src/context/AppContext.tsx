@@ -191,7 +191,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   });
 
   const [roadmap, setRoadmap] = useState<RoadmapMilestone[]>(() => {
-    const saved = localStorage.getItem('avishkar_roadmap');
+    const saved = localStorage.getItem('avishkar_roadmap_v2');
     return saved ? JSON.parse(saved) : INITIAL_ROADMAP;
   });
 
@@ -329,7 +329,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [assessmentResult]);
 
   useEffect(() => {
-    localStorage.setItem('avishkar_roadmap', JSON.stringify(roadmap));
+    localStorage.setItem('avishkar_roadmap_v2', JSON.stringify(roadmap));
   }, [roadmap]);
 
   useEffect(() => {
@@ -464,6 +464,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     department?: string;
     designation?: string;
     jurisdiction?: string;
+    aisheCode?: string;
+    officialDomain?: string;
+    cinGstin?: string;
+    linkedinUrl?: string;
+    prn?: string;
   }) => {
     try {
       const res = await api.registerUser(data);
@@ -592,7 +597,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const allDone = updatedModules.every(mod => mod.completed);
         return { ...m, modules: updatedModules, completed: allDone };
       });
-      localStorage.setItem('avishkar_roadmap', JSON.stringify(next));
+      localStorage.setItem('avishkar_roadmap_v2', JSON.stringify(next));
       return next;
     });
 

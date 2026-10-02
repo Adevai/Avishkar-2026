@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { api, API_BASE } from '../../services/api';
 import { Loader2 } from 'lucide-react';
-import { ASSESSMENT_QUESTIONS } from '../../data/mockData';
+import { ASSESSMENT_QUESTIONS } from '../../../server/dataProvenance';
 import { 
   BrainCircuit, 
   Clock, 
@@ -61,7 +61,7 @@ export const AIAssessment: React.FC = () => {
 
   // Dynamic AI-generated questions tailored to the student's chosen career goal.
   // Falls back to the static bank while generating or if generation fails.
-  const [questions, setQuestions] = useState<any[]>(cachedData?.questions || ASSESSMENT_QUESTIONS);
+  const [questions, setQuestions] = useState<any[]>(cachedData?.questions || []);
   const [assessmentId, setAssessmentId] = useState<string | null>(cachedData?.assessmentId || null);
   const [isGenerating, setIsGenerating] = useState(false);
 
@@ -242,7 +242,7 @@ export const AIAssessment: React.FC = () => {
   const startDynamicAssessment = async () => {
     setIsGenerating(true);
     try {
-      const res = await fetch(`${API_BASE}/assessment/generate`, {
+      const res = await (await import('../../services/api')).authFetch(`${API_BASE}/assessment/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ role: student?.targetRole || 'Software Engineer' }),
@@ -252,22 +252,21 @@ export const AIAssessment: React.FC = () => {
         if (Array.isArray(data.questions) && data.questions.length > 0) {
           setQuestions(data.questions);
           setAssessmentId(data.assessmentId);
-          setCurrentIdx(0);
-          setSelectedAnswers({});
+          if (data.generatedBy) {
+            setProctoringAlert(`Assessment mode: ${data.generatedBy === 'gemini' ? 'AI Generated (Personalized)' : 'Randomized Bank'}`);
+            setTimeout(() => setProctoringAlert(null), 5000);
+          }
+          setHasStarted(true);
         } else {
-          setQuestions(ASSESSMENT_QUESTIONS);
-          setAssessmentId(null);
+          setNotification('Received empty assessment from server.');
         }
       } else {
-        setQuestions(ASSESSMENT_QUESTIONS);
-        setAssessmentId(null);
+        setNotification('Backend generation failed. Please try again.');
       }
     } catch (e) {
-      setQuestions(ASSESSMENT_QUESTIONS);
-      setAssessmentId(null);
+      setNotification('Network error during generation. Please try again.');
     } finally {
       setIsGenerating(false);
-      setHasStarted(true);
     }
   };
 

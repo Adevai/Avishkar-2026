@@ -605,8 +605,8 @@ export const JobMatches: React.FC = () => {
                     <div className="mb-3 px-3 py-2 rounded-xl bg-slate-50 border border-slate-200/70 flex flex-wrap items-center justify-between gap-2 text-[11px]">
                       <div className="flex items-center gap-1.5 text-slate-600">
                         <TrendingUp className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                        <span className="font-semibold text-slate-700">Salary Benchmark:</span>
-                        <span className="text-slate-500">
+                        <span className="font-semibold text-slate-700">Salary Benchmark (estimate):</span>
+                        <span className="text-slate-500" title="Heuristic estimate from India fresher averages, role and city-tier multipliers — not employer-confirmed.">
                           Median: {bench.percentile50} • 90th %ile: {bench.percentile90}
                         </span>
                       </div>

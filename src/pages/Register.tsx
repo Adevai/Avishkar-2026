@@ -62,6 +62,9 @@ export const Register: React.FC = () => {
   const [otpSent, setOtpSent] = useState(false);
   const [otpError, setOtpError] = useState('');
   const [otpSuccess, setOtpSuccess] = useState('');
+  // Dev fallback code returned by the server when SMTP is unavailable
+  // (non-production only) — without this the OTP is invisible to the user.
+  const [devOtp, setDevOtp] = useState('');
 
   // Step 3: server-side registration failure (surfaced to the user — never silently swallowed)
   const [regError, setRegError] = useState('');
@@ -175,13 +178,10 @@ export const Register: React.FC = () => {
     try {
       const res = await api.requestRegistrationOtp(targetEmail, targetName);
       setOtpSent(true);
-      // devOtp is only present in non-production responses (SMTP fallback) so
-      // local testing never requires digging through the database for the code.
-      setOtpSuccess(
-        res.devOtp
-          ? `${res.message || 'Verification code sent'} — dev OTP: ${res.devOtp}`
-          : (res.message || `Verification code sent to ${targetEmail}`)
-      );
+      setDevOtp(res.devOtp || '');
+      setOtpSuccess(res.devOtp
+        ? 'Email delivery unavailable (dev SMTP fallback) — use the code shown below.'
+        : `Verification code sent to ${targetEmail}`);
     } catch (err: any) {
       setOtpError(err.message || 'Failed to dispatch verification code. Please try again.');
     } finally {
@@ -506,6 +506,22 @@ export const Register: React.FC = () => {
             <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center gap-2.5 text-emerald-700 text-xs font-semibold">
               <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
               <span>{otpSuccess}</span>
+            </div>
+          )}
+
+          {devOtp && (
+            <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-between gap-2.5 text-amber-900 text-xs font-semibold">
+              <span>
+                Dev verification code: <span className="font-mono font-extrabold tracking-widest">{devOtp}</span>
+                <span className="block text-[10px] font-medium text-amber-700 mt-0.5">Configure EMAIL_PASS (Gmail App Password) to receive it by email instead.</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => setOtpCode(devOtp)}
+                className="shrink-0 px-2.5 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 border border-amber-300 text-amber-900 text-[11px] font-bold transition-colors"
+              >
+                Fill code
+              </button>
             </div>
           )}
 

@@ -73,8 +73,11 @@ export interface BackendHealth {
 }
 
 export const api = {
+  // Authenticated so /analytics can scope results to the viewer (college TPO
+  // -> own institution, government -> jurisdiction). Anonymous callers get
+  // the platform-wide aggregate.
   async getAnalytics(): Promise<any> {
-    const res = await fetch(`${API_BASE}/analytics`);
+    const res = await authFetch(`${API_BASE}/analytics`);
     if (!res.ok) throw new Error('Failed to fetch analytics');
     return res.json();
   },
@@ -721,15 +724,19 @@ export const api = {
     return await res.json();
   },
 
-  async queryCopilot(userQuery: string, apiKey?: string): Promise<string> {
-    const res = await fetch(`${API_BASE}/copilot`, {
+  // Answers come from the server: Gemini when GEMINI_API_KEY is configured,
+  // otherwise an honest rule-based answer built from the caller's real
+  // profile (source: 'rule-based'). Client keys are intentionally ignored -
+  // the server uses its own key so users can never be phished for theirs.
+  async queryCopilot(userQuery: string): Promise<{ answer: string; source: 'gemini' | 'rule-based'; personalised: boolean }> {
+    const res = await authFetch(`${API_BASE}/copilot`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: userQuery, apiKey }),
+      body: JSON.stringify({ query: userQuery }),
     });
     if (!res.ok) throw new Error('Copilot query failed');
     const data = await res.json();
-    return data.answer;
+    return { answer: data.answer as string, source: data.source || 'rule-based', personalised: !!data.personalised };
   },
 
   async requestRegistrationOtp(email: string, name?: string): Promise<{ success: boolean; message: string; devOtp?: string }> {
