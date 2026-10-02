@@ -16,8 +16,8 @@ import {
   INITIAL_MOUS,
   INITIAL_PROBLEMS,
   INITIAL_ROADMAP,
-  ASSESSMENT_QUESTIONS,
 } from '../data/mockData';
+import { ASSESSMENT_QUESTIONS } from '../data/mockData';
 import { calculateJobMatch } from '../utils/matchCalculator';
 import { api, API_BASE, BackendHealth } from '../services/api';
 
@@ -194,7 +194,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const saved = localStorage.getItem('avishkar_roadmap_v2');
     return saved ? JSON.parse(saved) : INITIAL_ROADMAP;
   });
-
   const [jobs, setJobs] = useState<JobOpportunity[]>(() => {
     const saved = localStorage.getItem('avishkar_jobs');
     return saved ? JSON.parse(saved) : INITIAL_JOBS;

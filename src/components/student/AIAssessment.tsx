@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext';
 import { api, API_BASE } from '../../services/api';
 import { Loader2 } from 'lucide-react';
-import { ASSESSMENT_QUESTIONS } from '../../../server/dataProvenance';
+import { ASSESSMENT_QUESTIONS } from '../../../src/data/mockData';
 import { 
   BrainCircuit, 
   Clock, 

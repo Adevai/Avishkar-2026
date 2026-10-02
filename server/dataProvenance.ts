@@ -37,8 +37,6 @@ export interface SyntheticCounts {
 }
 
 /** Counts of synthetic rows per table (0s when tables are empty/absent). */
-import { ASSESSMENT_QUESTIONS } from '../src/data/mockData';
-
 export async function getSyntheticCounts(): Promise<SyntheticCounts> {
   const like = SYNTHETIC_PREFIXES.map(p => `id LIKE '${p}'`).join(' OR ');
   const res = await query(`
